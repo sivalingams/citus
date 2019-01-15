@@ -1367,6 +1367,11 @@ HasRecurringTuples(Node *node, RecurringTuplesType *recurType)
 			return true;
 		}
 
+		if (FindNodeCheckInRangeTableList(query->rtable, IsDistributedTableRTE))
+		{
+			return false;
+		}
+
 		return query_tree_walker((Query *) node, HasRecurringTuples,
 								 recurType, QTW_EXAMINE_RTES);
 	}
