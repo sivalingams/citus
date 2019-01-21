@@ -622,6 +622,13 @@ DeferErrorIfFromClauseRecurs(Query *queryTree)
 }
 
 
+/*
+ * DetermineQueryReturnsRecurringTuples returns tuple recurrence information
+ * in query result based on range table entries in from part.
+ *
+ * Returned information is used to prepare appropriate deferred error
+ * message for subquery pushdown checks.
+ */
 static RecurringTuplesType
 DetermineQueryReturnsRecurringTuples(Query *queryTree)
 {
@@ -648,7 +655,6 @@ DetermineQueryReturnsRecurringTuples(Query *queryTree)
 		 */
 		return RECURRING_TUPLES_INVALID;
 	}
-
 
 	/*
 	 * Try to figure out which type of recurring tuples we have to produce a
