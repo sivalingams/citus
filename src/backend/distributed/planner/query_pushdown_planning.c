@@ -65,6 +65,7 @@ static bool IsNodeQuery(Node *node);
 static bool IsOuterJoinExpr(Node *node);
 static bool WindowPartitionOnDistributionColumn(Query *query);
 static DeferredErrorMessage * DeferErrorIfFromClauseRecurs(Query *queryTree);
+static RecurringTuplesType DetermineQueryReturnsRecurringTuples(Query *queryTree);
 static DeferredErrorMessage * DeferredErrorIfUnsupportedRecurringTuplesJoin(
 	PlannerRestrictionContext *plannerRestrictionContext);
 static DeferredErrorMessage * DeferErrorIfUnsupportedTableCombination(Query *queryTree);
@@ -572,30 +573,7 @@ DeferErrorIfFromClauseRecurs(Query *queryTree)
 		return NULL;
 	}
 
-	if (FindNodeCheckInRangeTableList(queryTree->rtable, IsDistributedTableRTE))
-	{
-		/*
-		 * There is a distributed table somewhere in the FROM clause.
-		 *
-		 * In the typical case this means that the query does not recur,
-		 * but there are two exceptions:
-		 *
-		 * - outer joins such as reference_table LEFT JOIN distributed_table
-		 * - FROM reference_table WHERE .. (SELECT .. FROM distributed_table) ..
-		 *
-		 * However, we check all subqueries and joins separately, so we would
-		 * find such conditions in other calls.
-		 */
-		return NULL;
-	}
-
-
-	/*
-	 * Try to figure out which type of recurring tuples we have to produce a
-	 * relevant error message. If there are several we'll pick the first one.
-	 */
-	IsRecurringRangeTable(queryTree->rtable, &recurType);
-
+	recurType = DetermineQueryReturnsRecurringTuples(queryTree);
 	if (recurType == RECURRING_TUPLES_REFERENCE_TABLE)
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
@@ -641,6 +619,44 @@ DeferErrorIfFromClauseRecurs(Query *queryTree)
 	 */
 
 	return NULL;
+}
+
+
+static RecurringTuplesType
+DetermineQueryReturnsRecurringTuples(Query *queryTree)
+{
+	RecurringTuplesType recurType = RECURRING_TUPLES_INVALID;
+
+	if (queryTree->rtable == NIL)
+	{
+		return RECURRING_TUPLES_EMPTY_JOIN_TREE;
+	}
+
+	if (FindNodeCheckInRangeTableList(queryTree->rtable, IsDistributedTableRTE))
+	{
+		/*
+		 * There is a distributed table somewhere in the FROM clause.
+		 *
+		 * In the typical case this means that the query does not recur,
+		 * but there are two exceptions:
+		 *
+		 * - outer joins such as reference_table LEFT JOIN distributed_table
+		 * - FROM reference_table WHERE .. (SELECT .. FROM distributed_table) ..
+		 *
+		 * However, we check all subqueries and joins separately, so we would
+		 * find such conditions in other calls.
+		 */
+		return RECURRING_TUPLES_INVALID;
+	}
+
+
+	/*
+	 * Try to figure out which type of recurring tuples we have to produce a
+	 * relevant error message. If there are several we'll pick the first one.
+	 */
+	IsRecurringRangeTable(queryTree->rtable, &recurType);
+
+	return recurType;
 }
 
 
@@ -1062,11 +1078,11 @@ DeferErrorIfUnsupportedUnionQuery(Query *subqueryTree)
 
 		if (IsA(leftArg, RangeTblRef))
 		{
-			Node *leftArgSubquery = NULL;
+			Query *leftArgSubquery = NULL;
 			leftArgRTI = ((RangeTblRef *) leftArg)->rtindex;
-			leftArgSubquery = (Node *) rt_fetch(leftArgRTI,
-												subqueryTree->rtable)->subquery;
-			if (HasRecurringTuples(leftArgSubquery, &recurType))
+			leftArgSubquery = rt_fetch(leftArgRTI, subqueryTree->rtable)->subquery;
+			recurType = DetermineQueryReturnsRecurringTuples(leftArgSubquery);
+			if (recurType != RECURRING_TUPLES_INVALID)
 			{
 				break;
 			}
@@ -1074,11 +1090,11 @@ DeferErrorIfUnsupportedUnionQuery(Query *subqueryTree)
 
 		if (IsA(rightArg, RangeTblRef))
 		{
-			Node *rightArgSubquery = NULL;
+			Query *rightArgSubquery = NULL;
 			rightArgRTI = ((RangeTblRef *) rightArg)->rtindex;
-			rightArgSubquery = (Node *) rt_fetch(rightArgRTI,
-												 subqueryTree->rtable)->subquery;
-			if (HasRecurringTuples(rightArgSubquery, &recurType))
+			rightArgSubquery = rt_fetch(rightArgRTI, subqueryTree->rtable)->subquery;
+			recurType = DetermineQueryReturnsRecurringTuples(rightArgSubquery);
+			if (recurType != RECURRING_TUPLES_INVALID)
 			{
 				break;
 			}
@@ -1367,10 +1383,6 @@ HasRecurringTuples(Node *node, RecurringTuplesType *recurType)
 			return true;
 		}
 
-		if (FindNodeCheckInRangeTableList(query->rtable, IsDistributedTableRTE))
-		{
-			return false;
-		}
 
 		return query_tree_walker((Query *) node, HasRecurringTuples,
 								 recurType, QTW_EXAMINE_RTES);
