@@ -1200,8 +1200,12 @@ SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *command)
 	}
 	else if (alterTableType == AT_DetachPartition)
 	{
-		executeSequentially = true;
-		SetLocalMultiShardModifyModeToSequential();
+		/* check if there are foreign constraints to reference tables */
+		if (HasForeignKeyToReferenceTable(relationId))
+		{
+			executeSequentially = true;
+			SetLocalMultiShardModifyModeToSequential();
+		}
 	}
 
 	/*
