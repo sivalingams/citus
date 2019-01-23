@@ -1198,6 +1198,11 @@ SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *command)
 			}
 		}
 	}
+	else if (alterTableType == AT_DetachPartition)
+	{
+		executeSequentially = true;
+		SetLocalMultiShardModifyModeToSequential();
+	}
 
 	/*
 	 * If there has already been a parallel query executed, the sequential mode
