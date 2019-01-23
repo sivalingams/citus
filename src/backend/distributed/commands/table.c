@@ -1184,7 +1184,6 @@ SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *command)
 				PartitionMethod(rightRelationId) == DISTRIBUTE_BY_NONE)
 			{
 				executeSequentially = true;
-
 			}
 
 			/*
