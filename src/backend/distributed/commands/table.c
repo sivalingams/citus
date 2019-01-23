@@ -1184,6 +1184,18 @@ SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *command)
 				PartitionMethod(rightRelationId) == DISTRIBUTE_BY_NONE)
 			{
 				executeSequentially = true;
+
+			}
+
+			/*
+			 * Postgres performs additional selects when creating constraints
+			 * on partitioned tables. We need to set execution mode to
+			 * sequential for the select query so that ddl connections
+			 * we open does not fail due to previous select.
+			 */
+			if (executeSequentially && PartitionedTable(relationId))
+			{
+				SetLocalMultiShardModifyModeToSequential();
 			}
 		}
 	}
