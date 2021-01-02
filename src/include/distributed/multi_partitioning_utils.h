@@ -2,13 +2,13 @@
  * multi_partitioning_utils.h
  *	  Utility functions declarations for declarative partitioning
  *
- * Copyright (c) 2017, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  */
 #ifndef MULTI_PARTITIONING_UTILS_H_
 #define MULTI_PARTITIONING_UTILS_H_
 
 
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "nodes/pg_list.h"
 
 
@@ -19,6 +19,7 @@ extern bool PartitionTableNoLock(Oid relationId);
 extern bool IsChildTable(Oid relationId);
 extern bool IsParentTable(Oid relationId);
 extern Oid PartitionParentOid(Oid partitionOid);
+extern char * LongestPartitionName(Oid parentRelationId);
 extern List * PartitionList(Oid parentRelationId);
 extern char * GenerateDetachPartitionCommand(Oid partitionTableId);
 extern char * GenerateAttachShardPartitionCommand(ShardInterval *shardInterval);

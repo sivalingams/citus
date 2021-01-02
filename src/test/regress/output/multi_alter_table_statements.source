@@ -668,7 +668,7 @@ COMMIT;
 WARNING:  duplicate key value violates unique constraint "ddl_commands_command_key"
 DETAIL:  Key (command)=(CREATE INDEX) already exists.
 CONTEXT:  while executing command on localhost:57638
-WARNING:  failed to commit critical transaction on localhost:57638, metadata is likely out of sync
+WARNING:  failed to commit transaction on localhost:57638
 -- The block should have committed with a warning
 SELECT indexname, tablename FROM pg_indexes WHERE tablename = 'single_shard_items' ORDER BY 1;
    indexname    |     tablename      
@@ -999,22 +999,22 @@ SELECT value, count(*) FROM trigger_table GROUP BY value ORDER BY value;
 (1 row)
 
 ALTER TABLE trigger_table DISABLE TRIGGER ALL;
+ERROR:  triggers are only supported for citus local tables
 INSERT INTO trigger_table VALUES (1, 'trigger disabled');
 SELECT value, count(*) FROM trigger_table GROUP BY value ORDER BY value;
       value       | count 
 ------------------+-------
- trigger disabled |     1
- trigger enabled  |     1
-(2 rows)
+ trigger enabled  |     2
+(1 row)
 
 ALTER TABLE trigger_table ENABLE TRIGGER ALL;
+ERROR:  triggers are only supported for citus local tables
 INSERT INTO trigger_table VALUES (1, 'trigger disabled');
 SELECT value, count(*) FROM trigger_table GROUP BY value ORDER BY value;
       value       | count 
 ------------------+-------
- trigger disabled |     1
- trigger enabled  |     2
-(2 rows)
+ trigger enabled  |     3
+(1 row)
 
 DROP TABLE trigger_table;
 -- test ALTER TABLE ALL IN TABLESPACE

@@ -46,7 +46,7 @@ CREATE TABLE ex_on_non_part_col
 );
 SELECT create_distributed_table('ex_on_non_part_col', 'partition_col', 'hash');
 
--- now show that Citus can distribute unique and EXCLUDE constraints that 
+-- now show that Citus can distribute unique and EXCLUDE constraints that
 -- include the partition column for hash-partitioned tables.
 -- However, EXCLUDE constraints must include the partition column with
 -- an equality operator.
@@ -126,8 +126,8 @@ SELECT create_distributed_table('ex_overlaps', 'partition_col', 'hash');
 INSERT INTO ex_overlaps (partition_col, other_col) VALUES ('[2016-01-01 00:00:00, 2016-02-01 00:00:00]', '[2016-01-01 00:00:00, 2016-02-01 00:00:00]');
 INSERT INTO ex_overlaps (partition_col, other_col) VALUES ('[2016-01-01 00:00:00, 2016-02-01 00:00:00]', '[2016-01-15 00:00:00, 2016-02-01 00:00:00]');
 
--- now show that Citus can distribute unique and EXCLUDE constraints that 
--- include the partition column, for hash-partitioned tables. 
+-- now show that Citus can distribute unique and EXCLUDE constraints that
+-- include the partition column, for hash-partitioned tables.
 -- However, EXCLUDE constraints must include the partition column with
 -- an equality operator.
 -- These tests are for NAMED constraints.
@@ -224,11 +224,27 @@ CREATE TABLE check_example
 	other_other_col integer CHECK (abs(other_other_col) >= 100)
 );
 SELECT create_distributed_table('check_example', 'partition_col', 'hash');
-\c - - - :worker_1_port
+\c - - :public_worker_1_host :worker_1_port
 SELECT "Column", "Type", "Definition" FROM index_attrs WHERE
     relid = 'check_example_partition_col_key_365056'::regclass;
 SELECT "Constraint", "Definition" FROM table_checks WHERE relid='public.check_example_365056'::regclass;
-\c - - - :master_port
+\c - - :master_host :master_port
+
+-- Index-based constraints are created with shard-extended names, but others
+-- (e.g. expression-based table CHECK constraints) do _not_ have shardids in
+-- their object names, _at least originally as designed_. At some point, we
+-- mistakenly started extending _all_ constraint names, but _only_ for ALTER
+-- TABLE ... ADD CONSTRAINT commands (yes, even non-index constraints). So now
+-- the _same_ constraint definition could result in a non-extended name if made
+-- using CREATE TABLE and another name if made using AT ... ADD CONSTRAINT. So
+-- DROP CONSTRAINT started erroring because _it_ was also changed to always do
+-- shard-id extension. We've fixed that by looking for the non-extended name
+-- first and using it for DROP or VALIDATE commands that could be targeting it.
+
+-- As for the actual test: drop a constraint created by CREATE TABLE ... CHECK,
+-- which per the above description would have been created with a non-extended
+-- object name, but previously would have failed DROP as DROP does extension.
+ALTER TABLE check_example DROP CONSTRAINT check_example_other_col_check;
 
 -- drop unnecessary tables
 DROP TABLE pk_on_non_part_col, uq_on_non_part_col CASCADE;

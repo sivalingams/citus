@@ -1,7 +1,5 @@
--- print whether we're using version > 10 to make version-specific tests clear
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 10 AS version_above_nine;
-
+CREATE SCHEMA multi_subtransactions;
+SET search_path TO 'multi_subtransactions';
 
 CREATE TABLE artists (
     id bigint NOT NULL,
@@ -104,6 +102,103 @@ INSERT INTO artists VALUES (7, NULL);
 SAVEPOINT s3;
 ROLLBACK TO SAVEPOINT s3;
 COMMIT;
+
+-- Recover from multi-shard modify errors
+BEGIN;
+INSERT INTO artists VALUES (8, 'Sogand');
+SAVEPOINT s1;
+UPDATE artists SET name = NULL;
+ROLLBACK TO s1;
+INSERT INTO artists VALUES (9, 'Mohsen Namjoo');
+COMMIT;
+
+SELECT * FROM artists WHERE id IN (7, 8, 9) ORDER BY id;
+
+-- Recover from multi-shard copy shutdown failure.
+-- Constraint check for non-partition columns happen only at copy shutdown.
+BEGIN;
+DELETE FROM artists;
+SAVEPOINT s1;
+INSERT INTO artists SELECT i, NULL FROM generate_series(1, 5) i;
+ROLLBACK TO s1;
+INSERT INTO artists VALUES (10, 'Mahmoud Farshchian');
+COMMIT;
+
+SELECT * FROM artists WHERE id IN (9, 10) ORDER BY id;
+
+-- Recover from multi-shard copy send failure.
+-- Constraint check for partition column happens at copy send.
+BEGIN;
+DELETE FROM artists;
+SAVEPOINT s1;
+INSERT INTO artists SELECT NULL, NULL FROM generate_series(1, 5) i;
+ROLLBACK TO s1;
+INSERT INTO artists VALUES (11, 'Egon Schiele');
+COMMIT;
+
+SELECT * FROM artists WHERE id IN (10, 11) ORDER BY id;
+
+-- Recover from multi-shard copy startup failure.
+-- Check for existence of a value for partition columnn happens at copy startup.
+BEGIN;
+DELETE FROM artists;
+SAVEPOINT s1;
+INSERT INTO artists(name) SELECT 'a' FROM generate_series(1, 5) i;
+ROLLBACK TO s1;
+INSERT INTO artists VALUES (12, 'Marc Chagall');
+COMMIT;
+
+SELECT * FROM artists WHERE id IN (11, 12) ORDER BY id;
+
+-- Recover from multi-shard CTE modify failures
+create table t1(a int, b int);
+create table t2(a int, b int CHECK(b > 0));
+
+ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1190000;
+
+select create_distributed_table('t1', 'a'),
+       create_distributed_table('t2', 'a');
+
+begin;
+insert into t2 select i, i+1 from generate_series(1, 3) i;
+with r AS (
+    update t2 set b = b + 1
+    returning *
+) insert into t1 select * from r;
+savepoint s1;
+with r AS (
+    update t1 set b = b - 10
+    returning *
+) insert into t2 select * from r;
+rollback to savepoint s1;
+savepoint s2;
+with r AS (
+    update t2 set b = b - 10
+    returning *
+) insert into t1 select * from r;
+rollback to savepoint s2;
+savepoint s3;
+with r AS (
+    insert into t2 select i, i+1 from generate_series(-10,-5) i
+    returning *
+) insert into t1 select * from r;
+rollback to savepoint s3;
+savepoint s4;
+with r AS (
+    insert into t1 select i, i+1 from generate_series(-10,-5) i
+    returning *
+) insert into t2 select * from r;
+rollback to savepoint s4;
+with r AS (
+    update t2 set b = b + 1
+    returning *
+) insert into t1 select * from r;
+commit;
+
+select * from t2 order by a, b;
+select * from t1 order by a, b;
+
+drop table t1, t2;
 
 -- ===================================================================
 -- Tests for replication factor > 1
@@ -213,6 +308,27 @@ COMMIT;
 
 SELECT * FROM researchers WHERE lab_id=10;
 
+-- Verify that we don't have a memory leak in subtransactions
+-- See https://github.com/citusdata/citus/pull/4000
+
+CREATE FUNCTION text2number(v_value text) RETURNS numeric
+    LANGUAGE plpgsql VOLATILE
+    AS $$
+BEGIN
+ RETURN v_value::numeric;
+exception
+    when others then
+        return null;
+END;
+$$;
+
+-- if we leak at least an integer in each subxact, then size of TopTransactionSize
+-- will be way beyond the 50k limit. If issue #3999 happens, then this will also take
+-- a long time, since for each row we will create a memory context that is not destroyed
+-- until the end of command.
+SELECT max(text2number('1234')), max(public.top_transaction_context_size()) > 50000 AS leaked
+FROM generate_series(1, 20000);
+
 -- Clean-up
-DROP TABLE artists;
-DROP TABLE researchers;
+SET client_min_messages TO ERROR;
+DROP SCHEMA multi_subtransactions CASCADE;

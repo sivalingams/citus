@@ -66,7 +66,7 @@ DROP TABLE referencing_table;
 DROP TABLE referenced_table;
 
 -- test foreign constraint creation on append and range distributed tables
--- foreign keys are supported either in between distributed tables including the 
+-- foreign keys are supported either in between distributed tables including the
 -- distribution column or from distributed tables to reference tables.
 SET citus.shard_replication_factor TO 1;
 CREATE TABLE referenced_table(id int UNIQUE, test_column int, PRIMARY KEY(id, test_column));
@@ -135,7 +135,7 @@ SELECT * FROM referenced_table;
 -- multi shard cascading delete
 INSERT INTO referenced_table VALUES(2, 2);
 INSERT INTO referencing_table VALUES(2, 2);
-SELECT master_modify_multiple_shards('DELETE FROM referenced_table');
+DELETE FROM referenced_table;
 SELECT * FROM referencing_table;
 
 -- multi shard cascading delete with alter table
@@ -143,7 +143,7 @@ INSERT INTO referenced_table VALUES(3, 3);
 INSERT INTO referencing_table VALUES(3, 3);
 BEGIN;
 ALTER TABLE referencing_table ADD COLUMN x int DEFAULT 0;
-SELECT master_modify_multiple_shards('DELETE FROM referenced_table');
+DELETE FROM referenced_table;
 COMMIT;
 
 DROP TABLE referencing_table;
@@ -250,7 +250,7 @@ SELECT create_distributed_table('referencing_table', 'ref_id', 'hash');
 -- not skipping validation would result in a distributed query, which emits debug messages
 BEGIN;
 SET LOCAL citus.enable_ddl_propagation TO off;
-SET LOCAL client_min_messages TO DEBUG2;
+SET LOCAL client_min_messages TO DEBUG1;
 ALTER TABLE referencing_table ADD CONSTRAINT test_constraint FOREIGN KEY (ref_id) REFERENCES referenced_table (id);
 ABORT;
 
@@ -392,7 +392,7 @@ ALTER TABLE referencing_table DROP CONSTRAINT test_constraint;
 -- test MATCH SIMPLE
 ALTER TABLE referencing_table ADD CONSTRAINT test_constraint FOREIGN KEY(ref_id, id) REFERENCES referenced_table(id, test_column) MATCH SIMPLE;
 INSERT INTO referencing_table VALUES(null, 2);
-SELECT * FROM referencing_table;
+SELECT * FROM referencing_table ORDER BY 1,2;
 DELETE FROM referencing_table WHERE ref_id = 2;
 ALTER TABLE referencing_table DROP CONSTRAINT test_constraint;
 

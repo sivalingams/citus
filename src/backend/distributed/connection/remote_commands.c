@@ -3,7 +3,7 @@
  * remote_commands.c
  *   Helpers to make it easier to execute command on remote nodes.
  *
- * Copyright (c) 2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -15,7 +15,10 @@
 
 #include "distributed/connection_management.h"
 #include "distributed/errormessage.h"
+#include "distributed/listutils.h"
+#include "distributed/log_utils.h"
 #include "distributed/remote_commands.h"
+#include "distributed/cancel_utils.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/latch.h"
@@ -29,6 +32,8 @@
 bool LogRemoteCommands = false;
 
 
+static bool ClearResultsInternal(MultiConnection *connection, bool raiseErrors,
+								 bool discardWarnings);
 static bool FinishConnectionIO(MultiConnection *connection, bool raiseInterrupts);
 static WaitEventSet * BuildWaitEventSet(MultiConnection **allConnections,
 										int totalConnectionCount,
@@ -71,7 +76,7 @@ ForgetResults(MultiConnection *connection)
 
 
 /*
- * ClearResults clears a connection from pending activity,
+ * ClearResultsInternal clears a connection from pending activity,
  * returns true if all pending commands return success. It raises
  * error if raiseErrors flag is set, any command fails and transaction
  * is marked critical.
@@ -81,6 +86,27 @@ ForgetResults(MultiConnection *connection)
  */
 bool
 ClearResults(MultiConnection *connection, bool raiseErrors)
+{
+	return ClearResultsInternal(connection, raiseErrors, false);
+}
+
+
+/*
+ * ClearResultsDiscardWarnings does the same thing as ClearResults, but doesn't
+ * emit warnings.
+ */
+bool
+ClearResultsDiscardWarnings(MultiConnection *connection, bool raiseErrors)
+{
+	return ClearResultsInternal(connection, raiseErrors, true);
+}
+
+
+/*
+ * ClearResultsInternal is used by ClearResults and ClearResultsDiscardWarnings.
+ */
+static bool
+ClearResultsInternal(MultiConnection *connection, bool raiseErrors, bool discardWarnings)
 {
 	bool success = true;
 
@@ -103,7 +129,11 @@ ClearResults(MultiConnection *connection, bool raiseErrors)
 
 		if (!IsResponseOK(result))
 		{
-			ReportResultError(connection, result, WARNING);
+			if (!discardWarnings)
+			{
+				ReportResultError(connection, result, WARNING);
+			}
+
 			MarkRemoteTransactionFailed(connection, raiseErrors);
 
 			success = false;
@@ -143,9 +173,6 @@ ClearResultsIfReady(MultiConnection *connection)
 
 	while (true)
 	{
-		PGresult *result = NULL;
-		ExecStatusType resultStatus;
-
 		/*
 		 * If busy, there might still be results already received and buffered
 		 * by the OS. As connection is in non-blocking mode, we can check for
@@ -171,14 +198,14 @@ ClearResultsIfReady(MultiConnection *connection)
 			return false;
 		}
 
-		result = PQgetResult(pgConn);
+		PGresult *result = PQgetResult(pgConn);
 		if (result == NULL)
 		{
 			/* no more results available */
 			return true;
 		}
 
-		resultStatus = PQresultStatus(result);
+		ExecStatusType resultStatus = PQresultStatus(result);
 
 		/* only care about the status, can clear now */
 		PQclear(result);
@@ -203,37 +230,6 @@ ClearResultsIfReady(MultiConnection *connection)
 }
 
 
-/*
- * SqlStateMatchesCategory returns true if the given sql state (which may be
- * NULL if unknown) is in the given error category. Note that we use
- * ERRCODE_TO_CATEGORY macro to determine error category of the sql state and
- * expect the caller to use the same macro for the error category.
- */
-bool
-SqlStateMatchesCategory(char *sqlStateString, int category)
-{
-	bool sqlStateMatchesCategory = false;
-	int sqlState = 0;
-	int sqlStateCategory = 0;
-
-	if (sqlStateString == NULL)
-	{
-		return false;
-	}
-
-	sqlState = MAKE_SQLSTATE(sqlStateString[0], sqlStateString[1], sqlStateString[2],
-							 sqlStateString[3], sqlStateString[4]);
-
-	sqlStateCategory = ERRCODE_TO_CATEGORY(sqlState);
-	if (sqlStateCategory == category)
-	{
-		sqlStateMatchesCategory = true;
-	}
-
-	return sqlStateMatchesCategory;
-}
-
-
 /* report errors & warnings */
 
 /*
@@ -252,10 +248,23 @@ ReportConnectionError(MultiConnection *connection, int elevel)
 		messageDetail = pchomp(PQerrorMessage(pgConn));
 	}
 
-	ereport(elevel, (errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("connection error: %s:%d", nodeName, nodePort),
-					 messageDetail != NULL ?
-					 errdetail("%s", ApplyLogRedaction(messageDetail)) : 0));
+	if (messageDetail)
+	{
+		/*
+		 * We don't use ApplyLogRedaction(messageDetail) as we expect any error
+		 * detail that requires log reduction should have done it locally.
+		 */
+		ereport(elevel, (errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("connection to the remote node %s:%d failed with the "
+								"following error: %s", nodeName, nodePort,
+								messageDetail)));
+	}
+	else
+	{
+		ereport(elevel, (errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("connection to the remote node %s:%d failed",
+								nodeName, nodePort)));
+	}
 }
 
 
@@ -328,12 +337,29 @@ LogRemoteCommand(MultiConnection *connection, const char *command)
 		return;
 	}
 
-	ereport(LOG, (errmsg("issuing %s", ApplyLogRedaction(command)),
-				  errdetail("on server %s:%d", connection->hostname, connection->port)));
+	ereport(NOTICE, (errmsg("issuing %s", ApplyLogRedaction(command)),
+					 errdetail("on server %s@%s:%d connectionId: %ld", connection->user,
+							   connection->hostname,
+							   connection->port, connection->connectionId)));
 }
 
 
 /* wrappers around libpq functions, with command logging support */
+
+
+/*
+ * ExecuteCriticalRemoteCommandList calls ExecuteCriticalRemoteCommand for every
+ * command in the commandList.
+ */
+void
+ExecuteCriticalRemoteCommandList(MultiConnection *connection, List *commandList)
+{
+	const char *command = NULL;
+	foreach_ptr(command, commandList)
+	{
+		ExecuteCriticalRemoteCommand(connection, command);
+	}
+}
 
 
 /*
@@ -343,17 +369,15 @@ LogRemoteCommand(MultiConnection *connection, const char *command)
 void
 ExecuteCriticalRemoteCommand(MultiConnection *connection, const char *command)
 {
-	int querySent = 0;
-	PGresult *result = NULL;
 	bool raiseInterrupts = true;
 
-	querySent = SendRemoteCommand(connection, command);
+	int querySent = SendRemoteCommand(connection, command);
 	if (querySent == 0)
 	{
 		ReportConnectionError(connection, ERROR);
 	}
 
-	result = GetRemoteCommandResult(connection, raiseInterrupts);
+	PGresult *result = GetRemoteCommandResult(connection, raiseInterrupts);
 	if (!IsResponseOK(result))
 	{
 		ReportResultError(connection, result, ERROR);
@@ -375,18 +399,16 @@ int
 ExecuteOptionalRemoteCommand(MultiConnection *connection, const char *command,
 							 PGresult **result)
 {
-	int querySent = 0;
-	PGresult *localResult = NULL;
 	bool raiseInterrupts = true;
 
-	querySent = SendRemoteCommand(connection, command);
+	int querySent = SendRemoteCommand(connection, command);
 	if (querySent == 0)
 	{
 		ReportConnectionError(connection, WARNING);
 		return QUERY_SEND_FAILED;
 	}
 
-	localResult = GetRemoteCommandResult(connection, raiseInterrupts);
+	PGresult *localResult = GetRemoteCommandResult(connection, raiseInterrupts);
 	if (!IsResponseOK(localResult))
 	{
 		ReportResultError(connection, localResult, WARNING);
@@ -395,8 +417,21 @@ ExecuteOptionalRemoteCommand(MultiConnection *connection, const char *command,
 		return RESPONSE_NOT_OKAY;
 	}
 
-	*result = localResult;
-	return 0;
+	/*
+	 * store result if result has been set, when the user is not interested in the result
+	 * a NULL pointer could be passed and the result will be cleared.
+	 */
+	if (result != NULL)
+	{
+		*result = localResult;
+	}
+	else
+	{
+		PQclear(localResult);
+		ForgetResults(connection);
+	}
+
+	return RESPONSE_OKAY;
 }
 
 
@@ -410,10 +445,9 @@ ExecuteOptionalRemoteCommand(MultiConnection *connection, const char *command,
 int
 SendRemoteCommandParams(MultiConnection *connection, const char *command,
 						int parameterCount, const Oid *parameterTypes,
-						const char *const *parameterValues)
+						const char *const *parameterValues, bool binaryResults)
 {
 	PGconn *pgConn = connection->pgConn;
-	int rc = 0;
 
 	LogRemoteCommand(connection, command);
 
@@ -428,8 +462,8 @@ SendRemoteCommandParams(MultiConnection *connection, const char *command,
 
 	Assert(PQisnonblocking(pgConn));
 
-	rc = PQsendQueryParams(pgConn, command, parameterCount, parameterTypes,
-						   parameterValues, NULL, NULL, 0);
+	int rc = PQsendQueryParams(pgConn, command, parameterCount, parameterTypes,
+							   parameterValues, NULL, NULL, binaryResults ? 1 : 0);
 
 	return rc;
 }
@@ -446,7 +480,6 @@ int
 SendRemoteCommand(MultiConnection *connection, const char *command)
 {
 	PGconn *pgConn = connection->pgConn;
-	int rc = 0;
 
 	LogRemoteCommand(connection, command);
 
@@ -461,7 +494,7 @@ SendRemoteCommand(MultiConnection *connection, const char *command)
 
 	Assert(PQisnonblocking(pgConn));
 
-	rc = PQsendQuery(pgConn, command);
+	int rc = PQsendQuery(pgConn, command);
 
 	return rc;
 }
@@ -476,7 +509,6 @@ ReadFirstColumnAsText(PGresult *queryResult)
 {
 	List *resultRowList = NIL;
 	const int columnIndex = 0;
-	int64 rowIndex = 0;
 	int64 rowCount = 0;
 
 	ExecStatusType status = PQresultStatus(queryResult);
@@ -485,7 +517,7 @@ ReadFirstColumnAsText(PGresult *queryResult)
 		rowCount = PQntuples(queryResult);
 	}
 
-	for (rowIndex = 0; rowIndex < rowCount; rowIndex++)
+	for (int64 rowIndex = 0; rowIndex < rowCount; rowIndex++)
 	{
 		char *rowValue = PQgetvalue(queryResult, rowIndex, columnIndex);
 
@@ -519,7 +551,6 @@ PGresult *
 GetRemoteCommandResult(MultiConnection *connection, bool raiseInterrupts)
 {
 	PGconn *pgConn = connection->pgConn;
-	PGresult *result = NULL;
 
 	/*
 	 * Short circuit tests around the more expensive parts of this
@@ -545,7 +576,7 @@ GetRemoteCommandResult(MultiConnection *connection, bool raiseInterrupts)
 	/* no IO should be necessary to get result */
 	Assert(!PQisBusy(pgConn));
 
-	result = PQgetResult(connection->pgConn);
+	PGresult *result = PQgetResult(connection->pgConn);
 
 	return result;
 }
@@ -561,7 +592,6 @@ bool
 PutRemoteCopyData(MultiConnection *connection, const char *buffer, int nbytes)
 {
 	PGconn *pgConn = connection->pgConn;
-	int copyState = 0;
 	bool allowInterrupts = true;
 
 	if (PQstatus(pgConn) != CONNECTION_OK)
@@ -571,7 +601,7 @@ PutRemoteCopyData(MultiConnection *connection, const char *buffer, int nbytes)
 
 	Assert(PQisnonblocking(pgConn));
 
-	copyState = PQputCopyData(pgConn, buffer, nbytes);
+	int copyState = PQputCopyData(pgConn, buffer, nbytes);
 	if (copyState == -1)
 	{
 		return false;
@@ -610,7 +640,6 @@ bool
 PutRemoteCopyEnd(MultiConnection *connection, const char *errormsg)
 {
 	PGconn *pgConn = connection->pgConn;
-	int copyState = 0;
 	bool allowInterrupts = true;
 
 	if (PQstatus(pgConn) != CONNECTION_OK)
@@ -620,7 +649,7 @@ PutRemoteCopyEnd(MultiConnection *connection, const char *errormsg)
 
 	Assert(PQisnonblocking(pgConn));
 
-	copyState = PQputCopyEnd(pgConn, errormsg);
+	int copyState = PQputCopyEnd(pgConn, errormsg);
 	if (copyState == -1)
 	{
 		return false;
@@ -647,7 +676,7 @@ static bool
 FinishConnectionIO(MultiConnection *connection, bool raiseInterrupts)
 {
 	PGconn *pgConn = connection->pgConn;
-	int socket = PQsocket(pgConn);
+	int sock = PQsocket(pgConn);
 
 	Assert(pgConn);
 	Assert(PQisnonblocking(pgConn));
@@ -660,12 +689,10 @@ FinishConnectionIO(MultiConnection *connection, bool raiseInterrupts)
 	/* perform the necessary IO */
 	while (true)
 	{
-		int sendStatus = 0;
-		int rc = 0;
 		int waitFlags = WL_POSTMASTER_DEATH | WL_LATCH_SET;
 
 		/* try to send all pending data */
-		sendStatus = PQflush(pgConn);
+		int sendStatus = PQflush(pgConn);
 
 		/* if sending failed, there's nothing more we can do */
 		if (sendStatus == -1)
@@ -693,7 +720,7 @@ FinishConnectionIO(MultiConnection *connection, bool raiseInterrupts)
 			return true;
 		}
 
-		rc = WaitLatchOrSocket(MyLatch, waitFlags, socket, 0, PG_WAIT_EXTENSION);
+		int rc = WaitLatchOrSocket(MyLatch, waitFlags, sock, 0, PG_WAIT_EXTENSION);
 		if (rc & WL_POSTMASTER_DEATH)
 		{
 			ereport(ERROR, (errmsg("postmaster was shut down, exiting")));
@@ -714,7 +741,7 @@ FinishConnectionIO(MultiConnection *connection, bool raiseInterrupts)
 			 * interrupts held, return instead, and mark the transaction as
 			 * failed.
 			 */
-			if (InterruptHoldoffCount > 0 && (QueryCancelPending || ProcDiePending))
+			if (IsHoldOffCancellationReceived())
 			{
 				connection->remoteTransaction.transactionFailed = true;
 				break;
@@ -736,7 +763,6 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 	int totalConnectionCount = list_length(connectionList);
 	int pendingConnectionsStartIndex = 0;
 	int connectionIndex = 0;
-	ListCell *connectionCell = NULL;
 
 	MultiConnection **allConnections =
 		palloc(totalConnectionCount * sizeof(MultiConnection *));
@@ -745,11 +771,10 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 	WaitEventSet *waitEventSet = NULL;
 
 	/* convert connection list to an array such that we can move items around */
-	foreach(connectionCell, connectionList)
+	MultiConnection *connectionItem = NULL;
+	foreach_ptr(connectionItem, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
-
-		allConnections[connectionIndex] = connection;
+		allConnections[connectionIndex] = connectionItem;
 		connectionReady[connectionIndex] = false;
 		connectionIndex++;
 	}
@@ -777,7 +802,6 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 		{
 			bool cancellationReceived = false;
 			int eventIndex = 0;
-			int eventCount = 0;
 			long timeout = -1;
 			int pendingConnectionCount = totalConnectionCount -
 										 pendingConnectionsStartIndex;
@@ -797,14 +821,14 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 			}
 
 			/* wait for I/O events */
-			eventCount = WaitEventSetWait(waitEventSet, timeout, events,
-										  pendingConnectionCount, WAIT_EVENT_CLIENT_READ);
+			int eventCount = WaitEventSetWait(waitEventSet, timeout, events,
+											  pendingConnectionCount,
+											  WAIT_EVENT_CLIENT_READ);
 
 			/* process I/O events */
 			for (; eventIndex < eventCount; eventIndex++)
 			{
 				WaitEvent *event = &events[eventIndex];
-				MultiConnection *connection = NULL;
 				bool connectionIsReady = false;
 
 				if (event->events & WL_POSTMASTER_DEATH)
@@ -821,8 +845,7 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 						CHECK_FOR_INTERRUPTS();
 					}
 
-					if (InterruptHoldoffCount > 0 && (QueryCancelPending ||
-													  ProcDiePending))
+					if (IsHoldOffCancellationReceived())
 					{
 						/*
 						 * Break out of event loop immediately in case of cancellation.
@@ -836,7 +859,7 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 					continue;
 				}
 
-				connection = (MultiConnection *) event->user_data;
+				MultiConnection *connection = (MultiConnection *) event->user_data;
 
 				if (event->events & WL_SOCKET_WRITEABLE)
 				{
@@ -968,8 +991,6 @@ BuildWaitEventSet(MultiConnection **allConnections, int totalConnectionCount,
 				  int pendingConnectionsStartIndex)
 {
 	int pendingConnectionCount = totalConnectionCount - pendingConnectionsStartIndex;
-	WaitEventSet *waitEventSet = NULL;
-	int connectionIndex = 0;
 
 	/*
 	 * subtract 3 to make room for WL_POSTMASTER_DEATH, WL_LATCH_SET, and
@@ -982,13 +1003,15 @@ BuildWaitEventSet(MultiConnection **allConnections, int totalConnectionCount,
 
 	/* allocate pending connections + 2 for the signal latch and postmaster death */
 	/* (CreateWaitEventSet makes room for pgwin32_signal_event automatically) */
-	waitEventSet = CreateWaitEventSet(CurrentMemoryContext, pendingConnectionCount + 2);
+	WaitEventSet *waitEventSet = CreateWaitEventSet(CurrentMemoryContext,
+													pendingConnectionCount + 2);
 
-	for (connectionIndex = 0; connectionIndex < pendingConnectionCount; connectionIndex++)
+	for (int connectionIndex = 0; connectionIndex < pendingConnectionCount;
+		 connectionIndex++)
 	{
 		MultiConnection *connection = allConnections[pendingConnectionsStartIndex +
 													 connectionIndex];
-		int socket = PQsocket(connection->pgConn);
+		int sock = PQsocket(connection->pgConn);
 
 		/*
 		 * Always start by polling for both readability (server sent bytes)
@@ -996,7 +1019,7 @@ BuildWaitEventSet(MultiConnection **allConnections, int totalConnectionCount,
 		 */
 		int eventMask = WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE;
 
-		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL, (void *) connection);
+		AddWaitEventToSet(waitEventSet, eventMask, sock, NULL, (void *) connection);
 	}
 
 	/*
@@ -1007,4 +1030,33 @@ BuildWaitEventSet(MultiConnection **allConnections, int totalConnectionCount,
 	AddWaitEventToSet(waitEventSet, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
 
 	return waitEventSet;
+}
+
+
+/*
+ * SendCancelationRequest sends a cancelation request on the given connection.
+ * Return value indicates whether the cancelation request was sent successfully.
+ */
+bool
+SendCancelationRequest(MultiConnection *connection)
+{
+	char errorBuffer[ERROR_BUFFER_SIZE] = { 0 };
+
+	PGcancel *cancelObject = PQgetCancel(connection->pgConn);
+	if (cancelObject == NULL)
+	{
+		/* this can happen if connection is invalid */
+		return false;
+	}
+
+	bool cancelSent = PQcancel(cancelObject, errorBuffer, sizeof(errorBuffer));
+	if (!cancelSent)
+	{
+		ereport(WARNING, (errmsg("could not issue cancel request"),
+						  errdetail("Client error: %s", errorBuffer)));
+	}
+
+	PQfreeCancel(cancelObject);
+
+	return cancelSent;
 }

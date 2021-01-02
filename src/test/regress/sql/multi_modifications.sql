@@ -2,6 +2,11 @@ SET citus.shard_count TO 32;
 SET citus.next_shard_id TO 750000;
 SET citus.next_placement_id TO 750000;
 
+CREATE SCHEMA multi_modifications;
+
+-- some failure messages that comes from the worker nodes
+-- might change due to parallel executions, so suppress those
+-- using \set VERBOSITY terse
 
 -- ===================================================================
 -- test end-to-end modification functionality
@@ -85,11 +90,9 @@ INSERT INTO append_partitioned VALUES (414123, 'AAPL', 9580, '2004-10-19 10:23:5
 									   20.69);
 -- ensure the values are where we put them and query to ensure they are properly pruned
 SET client_min_messages TO 'DEBUG2';
-SET citus.task_executor_type TO 'real-time';
 SELECT * FROM range_partitioned WHERE id = 32743;
 SELECT * FROM append_partitioned WHERE id = 414123;
 SET client_min_messages TO DEFAULT;
-SET citus.task_executor_type TO DEFAULT;
 
 -- try inserting without a range-partitioned shard to receive the value
 INSERT INTO range_partitioned VALUES (999999, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy',
@@ -119,6 +122,7 @@ SET client_min_messages TO ERROR;
 INSERT INTO limit_orders VALUES (NULL, 'T', 975234, DEFAULT);
 
 -- INSERT violating column constraint
+\set VERBOSITY terse
 INSERT INTO limit_orders VALUES (18811, 'BUD', 14962, '2014-04-05 08:32:16', 'sell',
 								 -5.00);
 -- INSERT violating primary key constraint
@@ -130,7 +134,7 @@ INSERT INTO limit_orders VALUES (32743, 'LUV', 5994, '2001-04-16 03:37:28', 'buy
 -- INSERT, with RETURNING specified, failing with a non-constraint error
 INSERT INTO limit_orders VALUES (34153, 'LEE', 5994, '2001-04-16 03:37:28', 'buy', 0.58) RETURNING id / 0;
 
-
+\set VERBOSITY DEFAULT
 SET client_min_messages TO DEFAULT;
 
 -- commands with non-constant partition values are supported
@@ -202,8 +206,10 @@ WITH new_orders AS (INSERT INTO limit_orders VALUES (411, 'FLO', 12, '2017-07-02
 DELETE FROM limit_orders WHERE id < 0;
 
 -- we have to be careful that modifying CTEs are part of the transaction and can thus roll back
+\set VERBOSITY terse
 WITH new_orders AS (INSERT INTO limit_orders VALUES (412, 'FLO', 12, '2017-07-02 16:32:15', 'buy', 66))
 DELETE FROM limit_orders RETURNING id / 0;
+\set VERBOSITY default
 SELECT * FROM limit_orders WHERE id = 412;
 
 INSERT INTO limit_orders VALUES (246, 'TSLA', 162, '2007-07-02 16:32:15', 'sell', 20.69);
@@ -230,6 +236,7 @@ SELECT kind, limit_price FROM limit_orders WHERE id = 246;
 UPDATE limit_orders SET (kind, limit_price) = ('buy', 999) WHERE id = 246 RETURNING *;
 
 -- Test that on unique contraint violations, we fail fast
+\set VERBOSITY terse
 INSERT INTO limit_orders VALUES (275, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
 INSERT INTO limit_orders VALUES (275, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
 
@@ -245,17 +252,32 @@ ALTER TABLE limit_orders_750000 RENAME TO renamed_orders;
 \c - - - :master_port
 
 -- Fourth: Perform an INSERT on the remaining node
+-- the whole transaction should fail
+\set VERBOSITY terse
 INSERT INTO limit_orders VALUES (276, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
 
--- Last: Verify the insert worked but the deleted placement is now unhealthy
+-- set the shard name back
+\c - - - :worker_2_port
+
+-- Second: Move aside limit_orders shard on the second worker node
+ALTER TABLE renamed_orders RENAME TO limit_orders_750000;
+
+-- Verify the insert failed and both placements are healthy
+-- or the insert succeeded and placement marked unhealthy
+\c - - - :worker_1_port
+SELECT count(*) FROM limit_orders_750000 WHERE id = 276;
+
+\c - - - :worker_2_port
+SELECT count(*) FROM limit_orders_750000 WHERE id = 276;
+
+\c - - - :master_port
+
 SELECT count(*) FROM limit_orders WHERE id = 276;
 
 SELECT count(*)
 FROM   pg_dist_shard_placement AS sp,
 	   pg_dist_shard           AS s
 WHERE  sp.shardid = s.shardid
-AND    sp.nodename = 'localhost'
-AND    sp.nodeport = :worker_2_port
 AND    sp.shardstate = 3
 AND    s.logicalrelid = 'limit_orders'::regclass;
 
@@ -271,7 +293,9 @@ ALTER TABLE limit_orders_750000 RENAME TO renamed_orders;
 \c - - - :master_port
 
 -- Fourth: Perform an INSERT on the remaining node
+\set VERBOSITY terse
 INSERT INTO limit_orders VALUES (276, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
+\set VERBOSITY DEFAULT
 
 -- Last: Verify worker is still healthy
 SELECT count(*)
@@ -303,7 +327,7 @@ UPDATE limit_orders SET id = 246 WHERE id = 246;
 UPDATE limit_orders SET id = 246 WHERE id = 246 AND symbol = 'GM';
 UPDATE limit_orders SET id = limit_orders.id WHERE id = 246;
 
--- UPDATEs with a FROM clause are unsupported
+-- UPDATEs with a FROM clause are supported even with local tables
 UPDATE limit_orders SET limit_price = 0.00 FROM bidders
 					WHERE limit_orders.id = 246 AND
 						  limit_orders.bidder_id = bidders.id AND
@@ -366,7 +390,10 @@ SELECT array_of_values FROM limit_orders WHERE id = 246;
 -- STRICT functions work as expected
 CREATE FUNCTION temp_strict_func(integer,integer) RETURNS integer AS
 'SELECT COALESCE($1, 2) + COALESCE($1, 3);' LANGUAGE SQL STABLE STRICT;
+
+\set VERBOSITY terse
 UPDATE limit_orders SET bidder_id = temp_strict_func(1, null) WHERE id = 246;
+\set VERBOSITY default
 
 SELECT array_of_values FROM limit_orders WHERE id = 246;
 
@@ -519,6 +546,15 @@ INSERT INTO raw_table VALUES (2, 500);
 
 INSERT INTO summary_table VALUES (1);
 INSERT INTO summary_table VALUES (2);
+
+-- test noop deletes and updates
+DELETE FROM summary_table WHERE false;
+DELETE FROM summary_table WHERE null;
+DELETE FROM summary_table WHERE null > jsonb_build_array();
+
+UPDATE summary_table SET uniques = 0 WHERE false;
+UPDATE summary_table SET uniques = 0 WHERE null;
+UPDATE summary_table SET uniques = 0 WHERE null > jsonb_build_array();
 
 SELECT * FROM summary_table ORDER BY id;
 
@@ -688,13 +724,6 @@ UPDATE reference_summary_table SET average_value = average_query.average FROM (
 	) average_query
 WHERE id = 1;
 
--- test master_modify_multiple_shards() with subqueries and expect to fail
-SELECT master_modify_multiple_shards('
-	UPDATE summary_table SET average_value = average_query.average FROM (
-		SELECT avg(value) AS average FROM raw_table WHERE id = 1
-		) average_query
-	WHERE id = 1');
-
 -- test connection API via using COPY
 
 -- COPY on SELECT part
@@ -840,7 +869,24 @@ INSERT INTO summary_table (id) VALUES (5), ((SELECT id FROM summary_table));
 INSERT INTO reference_summary_table (id) VALUES ((SELECT id FROM summary_table));
 INSERT INTO summary_table (id) VALUES ((SELECT id FROM reference_summary_table));
 
+-- subqueries that would be eliminated by = null clauses
+DELETE FROM summary_table WHERE (
+    SELECT 1 FROM pg_catalog.pg_statio_sys_sequences
+) = null;
+DELETE FROM summary_table WHERE (
+    SELECT (select min(action_statement) from information_schema.triggers)
+    FROM pg_catalog.pg_statio_sys_sequences
+) = null;
+
+DELETE FROM summary_table WHERE id < (
+    SELECT 0 FROM pg_dist_node
+);
+
+CREATE TABLE multi_modifications.local (a int default 1, b int);
+INSERT INTO multi_modifications.local VALUES (default, (SELECT min(id) FROM summary_table));
+
 DROP TABLE raw_table;
 DROP TABLE summary_table;
 DROP TABLE reference_raw_table;
 DROP TABLE reference_summary_table;
+DROP SCHEMA multi_modifications CASCADE;

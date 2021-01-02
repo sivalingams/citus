@@ -1,4 +1,5 @@
 from collections import defaultdict
+from itertools import count
 import logging
 import re
 import os
@@ -125,6 +126,10 @@ class ActionsMixin:
         self.next = CancelHandler(self.root, pid)
         return self.next
 
+    def delay(self, timeMs):
+        self.next = DelayHandler(self.root, timeMs)
+        return self.next
+
 class AcceptHandler(Handler):
     def __init__(self, root):
         super().__init__(root)
@@ -179,6 +184,15 @@ class CancelHandler(Handler):
         os.kill(self.pid, signal.SIGINT)
         # give the signal a chance to be received before we let the packet through
         time.sleep(0.1)
+        return 'done'
+
+class DelayHandler(Handler):
+    'Delay a packet by sleeping before deciding what to do'
+    def __init__(self, root, timeMs):
+        super().__init__(root)
+        self.timeMs = timeMs
+    def _handle(self, flow, message):
+        time.sleep(self.timeMs/1000.0)
         return 'done'
 
 class Contains(Handler, ActionsMixin, FilterableMixin):
@@ -269,7 +283,7 @@ def build_handler(spec):
 handler = None  # the current handler used to process packets
 command_thread = None  # sits on the fifo and waits for new commands to come in
 captured_messages = queue.Queue()  # where we store messages used for recorder.dump()
-connection_count = 0  # so we can give connections ids in recorder.dump()
+connection_count = count()  # so we can give connections ids in recorder.dump()
 
 def listen_for_commands(fifoname):
 
@@ -325,7 +339,7 @@ def listen_for_commands(fifoname):
 
         if recorder.command is 'reset':
             result = ''
-            connection_count = 0
+            connection_count = count()
         elif recorder.command is not 'dump':
             # this should never happen
             raise Exception('Unrecognized command: {}'.format(recorder.command))
@@ -433,8 +447,7 @@ def tcp_message(flow):
 
     # Keep track of all the different connections, assign a unique id to each
     if not hasattr(flow, 'connection_id'):
-        flow.connection_id = connection_count
-        connection_count += 1  # this is not thread safe but I think that's fine
+        flow.connection_id = next(connection_count)
     tcp_msg.connection_id = flow.connection_id
 
     # The first packet the frontend sends shounld be parsed differently

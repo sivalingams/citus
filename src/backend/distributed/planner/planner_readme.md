@@ -2,14 +2,23 @@
 
 The distributed query planner is entered through the `distributed_planner` function in `distributed_planner.c`. This is the hook that Postgres calls instead of `standard_planner`.
 
-We always first call `standard_planner` to build a `PlannedStmt`. For queries containing a distributed table or reference table, we then proceed with distributed planning, which overwrites the `planTree` in the `PlannedStmt`.
+If the input query is trivial (e.g., no joins, no subqueries/ctes, single table and single shard), we create a very simple `PlannedStmt`. If the query is not trivial, call `standard_planner` to build a `PlannedStmt`. For queries containing a distributed table or reference table, we then proceed with distributed planning, which overwrites the `planTree` in the `PlannedStmt`.
 
 Distributed planning (`CreateDistributedPlan`) tries several different methods to plan the query:
 
- 1. Router planner, proceed if the query prunes down to a single set of co-located shards
- 2. Modification planning, proceed if the query is a DML command and all joins are co-located
- 3. Recursive planning, find CTEs and subqueries that cannot be pushed down and go back to 1
- 4. Logical planner, constructs a multi-relational algebra tree to find a distributed execution plan
+
+ 1. Fast-path router planner, proceed if the query prunes down to a single shard of a single table
+ 2. Router planner, proceed if the query prunes down to a single set of co-located shards
+ 3. Modification planning, proceed if the query is a DML command and all joins are co-located
+ 4. Recursive planning, find CTEs and subqueries that cannot be pushed down and go back to 1
+ 5. Logical planner, constructs a multi-relational algebra tree to find a distributed execution plan
+
+## Fast-path router planner
+
+By examining the query tree, if we can decide that the query hits only a single shard of a single table, we can skip calling `standard_planner()`. Later on the execution, we simply fetch the filter on the distribution key and do the pruning.
+
+As the name reveals, this can be considered as a sub-item of Router planner described below. The only difference is that fast-path planner doesn't rely on `standard_planner()` for collecting restriction information.
+
 
 ## Router planner
 
@@ -37,7 +46,7 @@ The join order planner is applied to the join tree in the original query and gen
 
 The logical optimizer uses commutativity rules to push project and select operators down below the `MultiCollect` nodes. Everything above the `MultiCollect` operator will be is executed on the coordinator and everything below on the workers. Additionally, the optimizer uses distributivity rules to push down operators below the `MultiJoin` nodes, such that filters and projections are applied prior to joins. This is primarily relevant for re-partition joins which first try to reduce the data by applying selections and projections, and then re-partitioning the result.
 
-A number of SQL clauses like aggregates, GROUP BY, ORDER BY, LIMIT can only be pushed down below the `MultiCollect` under certain conditions. All these clauses are bundled together in a `MultiExtendedOpNode`. After the basic transformation, the `MultiExtendedOpNode`s are directly above the `MultiCollect` nodes. They are then split into a master and a worker part and the worker part is pushed down below the `MultiCollect`.
+A number of SQL clauses like aggregates, GROUP BY, ORDER BY, LIMIT can only be pushed down below the `MultiCollect` under certain conditions. All these clauses are bundled together in a `MultiExtendedOpNode`. After the basic transformation, the `MultiExtendedOpNode`s are directly above the `MultiCollect` nodes. They are then split into a coordinator and a worker part and the worker part is pushed down below the `MultiCollect`.
 
 ### Physical planner
 

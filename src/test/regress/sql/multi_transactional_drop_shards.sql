@@ -7,6 +7,7 @@
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1410000;
 
 SET citus.shard_count TO 4;
+SET client_min_messages TO WARNING;
 
 -- test DROP TABLE(ergo master_drop_all_shards) in transaction, then ROLLBACK
 CREATE TABLE transactional_drop_shards(column1 int);
@@ -362,9 +363,10 @@ ORDER BY
     shardid, nodename, nodeport;
 
 \c - - - :master_port
+SET client_min_messages TO WARNING;
 
 -- try using the coordinator as a worker and then dropping the table
-SELECT master_add_node('localhost', :master_port);
+SELECT 1 FROM master_add_node('localhost', :master_port);
 CREATE TABLE citus_local (id serial, k int);
 SELECT create_distributed_table('citus_local', 'id');
 INSERT INTO citus_local (k) VALUES (2);
@@ -377,9 +379,8 @@ SELECT stop_metadata_sync_to_node('localhost', :worker_1_port);
 
 -- test DROP TABLE as a non-superuser in a transaction block
 CREATE USER try_drop_table WITH LOGIN;
-GRANT ALL ON SCHEMA public TO try_drop_table;
 SELECT run_command_on_workers('CREATE USER try_drop_table WITH LOGIN');
-SELECT run_command_on_workers('GRANT ALL ON SCHEMA public TO try_drop_table');
+GRANT ALL ON SCHEMA public TO try_drop_table;
 
 \c - try_drop_table - :master_port
 

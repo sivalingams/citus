@@ -22,11 +22,6 @@ CREATE TABLE not_null_table (
 
 SELECT master_get_table_ddl_events('not_null_table');
 
--- ensure tables not in search path are schema-prefixed
-CREATE SCHEMA not_in_path CREATE TABLE simple_table (id bigint);
-
-SELECT master_get_table_ddl_events('not_in_path.simple_table');
-
 -- even more complex constraints should be preserved...
 CREATE TABLE column_constraint_table (
 	first_name text,
@@ -45,6 +40,27 @@ CREATE TABLE table_constraint_table (
 );
 
 SELECT master_get_table_ddl_events('table_constraint_table');
+
+-- tables with "simple" CHECK constraints should be able to be distributed
+
+CREATE TABLE check_constraint_table_1(
+	id int,
+	b boolean,
+	CHECK(b)
+);
+
+SELECT create_distributed_table('check_constraint_table_1', 'id');
+
+SELECT master_get_table_ddl_events('check_constraint_table_1');
+
+-- including hardcoded Booleans
+CREATE TABLE check_constraint_table_2(
+	id int CHECK(true)
+);
+
+SELECT create_distributed_table('check_constraint_table_2', 'id');
+
+SELECT master_get_table_ddl_events('check_constraint_table_2');
 
 -- default values are supported
 CREATE TABLE default_value_table (
@@ -106,7 +122,18 @@ CREATE FOREIGN TABLE foreign_table (
 	full_name text not null default ''
 ) SERVER fake_fdw_server OPTIONS (encoding 'utf-8', compression 'true');
 
-SELECT master_get_table_ddl_events('foreign_table');
+SELECT create_distributed_table('foreign_table', 'id');
+ALTER FOREIGN TABLE foreign_table rename to renamed_foreign_table;
+ALTER FOREIGN TABLE renamed_foreign_table rename full_name to rename_name;
+ALTER FOREIGN TABLE renamed_foreign_table alter rename_name type char(8);
+\c - - :public_worker_1_host :worker_1_port
+select table_name, column_name, data_type
+from information_schema.columns
+where table_schema='public' and table_name like 'renamed_foreign_table_%' and column_name <> 'id'
+order by table_name;
+\c - - :master_host :master_port
+
+SELECT master_get_table_ddl_events('renamed_foreign_table');
 
 -- propagating views is not supported
 CREATE VIEW local_view AS SELECT * FROM simple_table;
@@ -115,7 +142,13 @@ SELECT master_get_table_ddl_events('local_view');
 
 -- clean up
 DROP VIEW IF EXISTS local_view;
-DROP FOREIGN TABLE IF EXISTS foreign_table;
+DROP FOREIGN TABLE IF EXISTS renamed_foreign_table;
+\c - - :public_worker_1_host :worker_1_port
+select table_name, column_name, data_type
+from information_schema.columns
+where table_schema='public' and table_name like 'renamed_foreign_table_%' and column_name <> 'id'
+order by table_name;
+\c - - :master_host :master_port
 DROP TABLE IF EXISTS simple_table, not_null_table, column_constraint_table,
 					 table_constraint_table, default_value_table, pkey_table,
 					 unique_table, clustered_table, fiddly_table;

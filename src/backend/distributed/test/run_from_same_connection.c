@@ -6,7 +6,7 @@
  * same connection. UDFs will be used to test MX functionalities in isolation
  * tests.
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -18,12 +18,13 @@
 #include "access/xact.h"
 #include "distributed/connection_management.h"
 #include "distributed/function_utils.h"
+#include "distributed/intermediate_result_pruning.h"
 #include "distributed/lock_graph.h"
-#include "distributed/master_protocol.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/remote_commands.h"
 #include "distributed/run_from_same_connection.h"
-#include "distributed/task_tracker.h"
+
 #include "distributed/version_compat.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
@@ -40,7 +41,7 @@
 
 
 static bool allowNonIdleRemoteTransactionOnXactHandling = false;
-static MultiConnection *connection = NULL;
+static MultiConnection *singleConnection = NULL;
 
 
 /*
@@ -51,7 +52,7 @@ int IsolationTestSessionRemoteProcessID = -1;
 int IsolationTestSessionProcessID = -1;
 
 
-static int64 GetRemoteProcessId(MultiConnection *connection);
+static int64 GetRemoteProcessId(void);
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(start_session_level_connection_to_node);
@@ -85,11 +86,13 @@ start_session_level_connection_to_node(PG_FUNCTION_ARGS)
 	text *nodeName = PG_GETARG_TEXT_P(0);
 	uint32 nodePort = PG_GETARG_UINT32(1);
 	char *nodeNameString = text_to_cstring(nodeName);
+	int connectionFlags = 0;
 
 	CheckCitusVersion(ERROR);
 
-	if (connection != NULL && (strcmp(connection->hostname, nodeNameString) != 0 ||
-							   connection->port != nodePort))
+	if (singleConnection != NULL && (strcmp(singleConnection->hostname,
+											nodeNameString) != 0 ||
+									 singleConnection->port != nodePort))
 	{
 		elog(ERROR,
 			 "can not connect different worker nodes from the same session using start_session_level_connection_to_node");
@@ -99,13 +102,13 @@ start_session_level_connection_to_node(PG_FUNCTION_ARGS)
 	 * In order to keep connection open even with an open transaction,
 	 * allowSessionLifeSpanWithOpenTransaction is set to true.
 	 */
-	if (connection == NULL)
+	if (singleConnection == NULL)
 	{
-		connection = GetNodeConnection(SESSION_LIFESPAN, nodeNameString, nodePort);
+		singleConnection = GetNodeConnection(connectionFlags, nodeNameString, nodePort);
 		allowNonIdleRemoteTransactionOnXactHandling = true;
 	}
 
-	if (PQstatus(connection->pgConn) != CONNECTION_OK)
+	if (PQstatus(singleConnection->pgConn) != CONNECTION_OK)
 	{
 		elog(ERROR, "failed to connect to %s:%d", nodeNameString, (int) nodePort);
 	}
@@ -134,9 +137,8 @@ run_commands_on_session_level_connection_to_node(PG_FUNCTION_ARGS)
 	StringInfo workerProcessStringInfo = makeStringInfo();
 	MultiConnection *localConnection = GetNodeConnection(0, LOCAL_HOST_NAME,
 														 PostPortNumber);
-	Oid pgReloadConfOid = InvalidOid;
 
-	if (!connection)
+	if (!singleConnection)
 	{
 		elog(ERROR,
 			 "start_session_level_connection_to_node must be called first to open a session level connection");
@@ -144,9 +146,9 @@ run_commands_on_session_level_connection_to_node(PG_FUNCTION_ARGS)
 
 	appendStringInfo(processStringInfo, ALTER_CURRENT_PROCESS_ID, MyProcPid);
 	appendStringInfo(workerProcessStringInfo, ALTER_CURRENT_WORKER_PROCESS_ID,
-					 GetRemoteProcessId(connection));
+					 GetRemoteProcessId());
 
-	ExecuteCriticalRemoteCommand(connection, queryString);
+	ExecuteCriticalRemoteCommand(singleConnection, queryString);
 
 	/*
 	 * Since we cannot run `ALTER SYSTEM` command within a transaction, we are
@@ -158,7 +160,7 @@ run_commands_on_session_level_connection_to_node(PG_FUNCTION_ARGS)
 	CloseConnection(localConnection);
 
 	/* Call pg_reload_conf UDF to update changed GUCs above on each backend */
-	pgReloadConfOid = FunctionOid("pg_catalog", "pg_reload_conf", 0);
+	Oid pgReloadConfOid = FunctionOid("pg_catalog", "pg_reload_conf", 0);
 	OidFunctionCall0(pgReloadConfOid);
 
 
@@ -176,10 +178,10 @@ stop_session_level_connection_to_node(PG_FUNCTION_ARGS)
 {
 	allowNonIdleRemoteTransactionOnXactHandling = false;
 
-	if (connection != NULL)
+	if (singleConnection != NULL)
 	{
-		CloseConnection(connection);
-		connection = NULL;
+		CloseConnection(singleConnection);
+		singleConnection = NULL;
 	}
 
 	PG_RETURN_VOID();
@@ -191,24 +193,26 @@ stop_session_level_connection_to_node(PG_FUNCTION_ARGS)
  * by the connection.
  */
 static int64
-GetRemoteProcessId(MultiConnection *connection)
+GetRemoteProcessId()
 {
 	StringInfo queryStringInfo = makeStringInfo();
 	PGresult *result = NULL;
-	int64 rowCount = 0;
 
 	appendStringInfo(queryStringInfo, GET_PROCESS_ID);
 
-	ExecuteOptionalRemoteCommand(connection, queryStringInfo->data, &result);
+	ExecuteOptionalRemoteCommand(singleConnection, queryStringInfo->data, &result);
 
-	rowCount = PQntuples(result);
+	int64 rowCount = PQntuples(result);
 
 	if (rowCount != 1)
 	{
 		PG_RETURN_VOID();
 	}
 
-	ClearResults(connection, false);
+	int64 resultValue = ParseIntField(result, 0, 0);
 
-	return ParseIntField(result, 0, 0);
+	PQclear(result);
+	ClearResults(singleConnection, false);
+
+	return resultValue;
 }

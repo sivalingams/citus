@@ -3,26 +3,34 @@
  * table.c
  *    Commands for creating and altering distributed tables.
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
-
+#include "distributed/pg_version_constants.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "access/genam.h"
+#endif
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_constraint.h"
 #include "commands/tablecmds.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
-#include "distributed/master_protocol.h"
+#include "distributed/deparser.h"
+#include "distributed/deparse_shard_query.h"
+#include "distributed/listutils.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_partitioning_utils.h"
+#include "distributed/reference_table_utils.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/resource_lock.h"
 #include "distributed/version_compat.h"
@@ -35,12 +43,32 @@
 
 
 /* Local functions forward declarations for unsupported command checks */
+static void PostprocessCreateTableStmtPartitionOf(CreateStmt *createStatement,
+												  const char *queryString);
+static void ErrorIfAlterTableDefinesFKeyFromPostgresToCitusLocalTable(
+	AlterTableStmt *alterTableStatement);
+static List * GetAlterTableStmtFKeyConstraintList(AlterTableStmt *alterTableStatement);
+static List * GetAlterTableCommandFKeyConstraintList(AlterTableCmd *command);
+static bool AlterTableCommandTypeIsTrigger(AlterTableType alterTableType);
 static void ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement);
+static void ErrorIfCitusLocalTablePartitionCommand(AlterTableCmd *alterTableCmd,
+												   Oid parentRelationId);
+static Oid GetPartitionCommandChildRelationId(AlterTableCmd *alterTableCmd,
+											  bool missingOk);
 static List * InterShardDDLTaskList(Oid leftRelationId, Oid rightRelationId,
 									const char *commandString);
 static bool AlterInvolvesPartitionColumn(AlterTableStmt *alterTableStatement,
 										 AlterTableCmd *command);
 static void ErrorIfUnsupportedAlterAddConstraintStmt(AlterTableStmt *alterTableStatement);
+static List * CreateRightShardListForInterShardDDLTask(Oid rightRelationId,
+													   Oid leftRelationId,
+													   List *leftShardList);
+static void SetInterShardDDLTaskPlacementList(Task *task,
+											  ShardInterval *leftShardInterval,
+											  ShardInterval *rightShardInterval);
+static void SetInterShardDDLTaskRelationShardList(Task *task,
+												  ShardInterval *leftShardInterval,
+												  ShardInterval *rightShardInterval);
 
 /*
  * We need to run some of the commands sequentially if there is a foreign constraint
@@ -49,7 +77,7 @@ static void ErrorIfUnsupportedAlterAddConstraintStmt(AlterTableStmt *alterTableS
 static bool SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *command);
 
 /*
- * ProcessDropTableStmt processes DROP TABLE commands for partitioned tables.
+ * PreprocessDropTableStmt processes DROP TABLE commands for partitioned tables.
  * If we are trying to DROP partitioned tables, we first need to go to MX nodes
  * and DETACH partitions from their parents. Otherwise, we process DROP command
  * multiple times in MX workers. For shards, we send DROP commands with IF EXISTS
@@ -58,27 +86,32 @@ static bool SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *comma
  * Postgres catalogs via performDeletion function, thus we need to be cautious
  * about not processing same DROP command twice.
  */
-void
-ProcessDropTableStmt(DropStmt *dropTableStatement)
+List *
+PreprocessDropTableStmt(Node *node, const char *queryString)
 {
-	ListCell *dropTableCell = NULL;
+	DropStmt *dropTableStatement = castNode(DropStmt, node);
 
 	Assert(dropTableStatement->removeType == OBJECT_TABLE);
 
-	foreach(dropTableCell, dropTableStatement->objects)
+	List *tableNameList = NULL;
+	foreach_ptr(tableNameList, dropTableStatement->objects)
 	{
-		List *tableNameList = (List *) lfirst(dropTableCell);
 		RangeVar *tableRangeVar = makeRangeVarFromNameList(tableNameList);
 		bool missingOK = true;
-		List *partitionList = NIL;
-		ListCell *partitionCell = NULL;
 
 		Oid relationId = RangeVarGetRelid(tableRangeVar, AccessShareLock, missingOK);
 
 		/* we're not interested in non-valid, non-distributed relations */
-		if (relationId == InvalidOid || !IsDistributedTable(relationId))
+		if (relationId == InvalidOid || !IsCitusTable(relationId))
 		{
 			continue;
+		}
+
+		if (IsCitusTableType(relationId, REFERENCE_TABLE))
+		{
+			/* prevent concurrent EnsureReferenceTablesExistOnAllNodes */
+			int colocationId = CreateReferenceTableColocationId();
+			LockColocationId(colocationId, ExclusiveLock);
 		}
 
 		/* invalidate foreign key cache if the table involved in any foreign key */
@@ -95,78 +128,114 @@ ProcessDropTableStmt(DropStmt *dropTableStatement)
 
 		EnsureCoordinator();
 
-		partitionList = PartitionList(relationId);
+		List *partitionList = PartitionList(relationId);
 		if (list_length(partitionList) == 0)
 		{
 			continue;
 		}
 
-		SendCommandToWorkers(WORKERS_WITH_METADATA, DISABLE_DDL_PROPAGATION);
+		SendCommandToWorkersWithMetadata(DISABLE_DDL_PROPAGATION);
 
-		foreach(partitionCell, partitionList)
+		Oid partitionRelationId = InvalidOid;
+		foreach_oid(partitionRelationId, partitionList)
 		{
-			Oid partitionRelationId = lfirst_oid(partitionCell);
 			char *detachPartitionCommand =
 				GenerateDetachPartitionCommand(partitionRelationId);
 
-			SendCommandToWorkers(WORKERS_WITH_METADATA, detachPartitionCommand);
+			SendCommandToWorkersWithMetadata(detachPartitionCommand);
 		}
 	}
+
+	return NIL;
 }
 
 
 /*
- * ProcessCreateTableStmtPartitionOf takes CreateStmt object as a parameter but
- * it only processes CREATE TABLE ... PARTITION OF statements and it checks if
- * user creates the table as a partition of a distributed table. In that case,
- * it distributes partition as well. Since the table itself is a partition,
- * CreateDistributedTable will attach it to its parent table automatically after
- * distributing it.
+ * PostprocessCreateTableStmt takes CreateStmt object as a parameter and errors
+ * out if it creates a table with a foreign key that references to a citus local
+ * table if pg version is older than 13 (see comment in function).
  *
- * This function does nothing if the provided CreateStmt is not a CREATE TABLE ...
- * PARTITION OF command.
+ * This function also processes CREATE TABLE ... PARTITION OF statements via
+ * PostprocessCreateTableStmtPartitionOf function.
  */
 void
-ProcessCreateTableStmtPartitionOf(CreateStmt *createStatement)
+PostprocessCreateTableStmt(CreateStmt *createStatement, const char *queryString)
 {
+#if PG_VERSION_NUM < PG_VERSION_13
+
+	/*
+	 * Postgres processes foreign key constraints implied by CREATE TABLE
+	 * commands by internally executing ALTER TABLE commands via standard
+	 * process utility starting from PG13. Hence, we will already perform
+	 * unsupported foreign key checks via PreprocessAlterTableStmt function
+	 * in PG13. But for the older version, we need to do unsupported foreign
+	 * key checks here.
+	 */
+
+	/*
+	 * Relation must exist and it is already locked as standard process utility
+	 * is already executed.
+	 */
+	bool missingOk = false;
+	Oid relationId = RangeVarGetRelid(createStatement->relation, NoLock, missingOk);
+	if (HasForeignKeyToCitusLocalTable(relationId))
+	{
+		ErrorOutForFKeyBetweenPostgresAndCitusLocalTable(relationId);
+	}
+#endif
+
 	if (createStatement->inhRelations != NIL && createStatement->partbound != NULL)
 	{
-		RangeVar *parentRelation = linitial(createStatement->inhRelations);
-		bool parentMissingOk = false;
-		Oid parentRelationId = RangeVarGetRelid(parentRelation, NoLock,
-												parentMissingOk);
-
-		/* a partition can only inherit from single parent table */
-		Assert(list_length(createStatement->inhRelations) == 1);
-
-		Assert(parentRelationId != InvalidOid);
-
-		/*
-		 * If a partition is being created and if its parent is a distributed
-		 * table, we will distribute this table as well.
-		 */
-		if (IsDistributedTable(parentRelationId))
-		{
-			bool missingOk = false;
-			Oid relationId = RangeVarGetRelid(createStatement->relation, NoLock,
-											  missingOk);
-			Var *parentDistributionColumn = DistPartitionKey(parentRelationId);
-			char parentDistributionMethod = DISTRIBUTE_BY_HASH;
-			char *parentRelationName = generate_qualified_relation_name(parentRelationId);
-			bool viaDeprecatedAPI = false;
-
-			CreateDistributedTable(relationId, parentDistributionColumn,
-								   parentDistributionMethod, parentRelationName,
-								   viaDeprecatedAPI);
-		}
+		/* process CREATE TABLE ... PARTITION OF command */
+		PostprocessCreateTableStmtPartitionOf(createStatement, queryString);
 	}
 }
 
 
 /*
- * ProcessAlterTableStmtAttachPartition takes AlterTableStmt object as parameter
- * but it only processes into ALTER TABLE ... ATTACH PARTITION commands and
- * distributes the partition if necessary. There are four cases to consider;
+ * PostprocessCreateTableStmtPartitionOf processes CREATE TABLE ... PARTITION OF
+ * statements and it checks if user creates the table as a partition of a distributed
+ * table. In that case, it distributes partition as well. Since the table itself is a
+ * partition, CreateDistributedTable will attach it to its parent table automatically
+ * after distributing it.
+ */
+static void
+PostprocessCreateTableStmtPartitionOf(CreateStmt *createStatement, const
+									  char *queryString)
+{
+	RangeVar *parentRelation = linitial(createStatement->inhRelations);
+	bool missingOk = false;
+	Oid parentRelationId = RangeVarGetRelid(parentRelation, NoLock, missingOk);
+
+	/* a partition can only inherit from single parent table */
+	Assert(list_length(createStatement->inhRelations) == 1);
+
+	Assert(parentRelationId != InvalidOid);
+
+	/*
+	 * If a partition is being created and if its parent is a distributed
+	 * table, we will distribute this table as well.
+	 */
+	if (IsCitusTable(parentRelationId))
+	{
+		Oid relationId = RangeVarGetRelid(createStatement->relation, NoLock, missingOk);
+		Var *parentDistributionColumn = DistPartitionKeyOrError(parentRelationId);
+		char parentDistributionMethod = DISTRIBUTE_BY_HASH;
+		char *parentRelationName = generate_qualified_relation_name(parentRelationId);
+		bool viaDeprecatedAPI = false;
+
+		CreateDistributedTable(relationId, parentDistributionColumn,
+							   parentDistributionMethod, parentRelationName,
+							   viaDeprecatedAPI);
+	}
+}
+
+
+/*
+ * PostprocessAlterTableStmtAttachPartition takes AlterTableStmt object as
+ * parameter but it only processes into ALTER TABLE ... ATTACH PARTITION
+ * commands and distributes the partition if necessary. There are four cases
+ * to consider;
  *
  * Parent is not distributed, partition is not distributed: We do not need to
  * do anything in this case.
@@ -189,16 +258,14 @@ ProcessCreateTableStmtPartitionOf(CreateStmt *createStatement)
  * This function does nothing if the provided CreateStmt is not an ALTER TABLE ...
  * ATTACH PARTITION OF command.
  */
-void
-ProcessAlterTableStmtAttachPartition(AlterTableStmt *alterTableStatement)
+List *
+PostprocessAlterTableStmtAttachPartition(AlterTableStmt *alterTableStatement,
+										 const char *queryString)
 {
 	List *commandList = alterTableStatement->cmds;
-	ListCell *commandCell = NULL;
-
-	foreach(commandCell, commandList)
+	AlterTableCmd *alterTableCommand = NULL;
+	foreach_ptr(alterTableCommand, commandList)
 	{
-		AlterTableCmd *alterTableCommand = (AlterTableCmd *) lfirst(commandCell);
-
 		if (alterTableCommand->subtype == AT_AttachPartition)
 		{
 			Oid relationId = AlterTableLookupRelation(alterTableStatement, NoLock);
@@ -211,10 +278,10 @@ ProcessAlterTableStmtAttachPartition(AlterTableStmt *alterTableStatement)
 			 * If user first distributes the table then tries to attach it to non
 			 * distributed table, we error out.
 			 */
-			if (!IsDistributedTable(relationId) &&
-				IsDistributedTable(partitionRelationId))
+			if (!IsCitusTable(relationId) &&
+				IsCitusTable(partitionRelationId))
 			{
-				char *parentRelationName = get_rel_name(partitionRelationId);
+				char *parentRelationName = get_rel_name(relationId);
 
 				ereport(ERROR, (errmsg("non-distributed tables cannot have "
 									   "distributed partitions"),
@@ -223,10 +290,10 @@ ProcessAlterTableStmtAttachPartition(AlterTableStmt *alterTableStatement)
 			}
 
 			/* if parent of this table is distributed, distribute this table too */
-			if (IsDistributedTable(relationId) &&
-				!IsDistributedTable(partitionRelationId))
+			if (IsCitusTable(relationId) &&
+				!IsCitusTable(partitionRelationId))
 			{
-				Var *distributionColumn = DistPartitionKey(relationId);
+				Var *distributionColumn = DistPartitionKeyOrError(relationId);
 				char distributionMethod = DISTRIBUTE_BY_HASH;
 				char *parentRelationName = generate_qualified_relation_name(relationId);
 				bool viaDeprecatedAPI = false;
@@ -237,30 +304,51 @@ ProcessAlterTableStmtAttachPartition(AlterTableStmt *alterTableStatement)
 			}
 		}
 	}
+
+	return NIL;
 }
 
 
 /*
- * PlanAlterTableStmt determines whether a given ALTER TABLE statement involves
- * a distributed table. If so (and if the statement does not use unsupported
- * options), it modifies the input statement to ensure proper execution against
- * the master node table and creates a DDLJob to encapsulate information needed
- * during the worker node portion of DDL execution before returning that DDLJob
- * in a List. If no distributed table is involved, this function returns NIL.
+ * PostprocessAlterTableSchemaStmt is executed after the change has been applied
+ * locally, we can now use the new dependencies of the table to ensure all its
+ * dependencies exist on the workers before we apply the commands remotely.
  */
 List *
-PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCommand)
+PostprocessAlterTableSchemaStmt(Node *node, const char *queryString)
 {
-	List *ddlJobs = NIL;
-	DDLJob *ddlJob = NULL;
-	LOCKMODE lockmode = 0;
-	Oid leftRelationId = InvalidOid;
-	Oid rightRelationId = InvalidOid;
-	char leftRelationKind;
-	bool isDistributedRelation = false;
-	List *commandList = NIL;
-	ListCell *commandCell = NULL;
-	bool executeSequentially = false;
+	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
+	Assert(stmt->objectType == OBJECT_TABLE);
+
+	/*
+	 * We will let Postgres deal with missing_ok
+	 */
+	ObjectAddress tableAddress = GetObjectAddressFromParseTree((Node *) stmt, true);
+
+	if (!ShouldPropagate() || !IsCitusTable(tableAddress.objectId))
+	{
+		return NIL;
+	}
+
+	EnsureDependenciesExistOnAllNodes(&tableAddress);
+
+	return NIL;
+}
+
+
+/*
+ * PreprocessAlterTableStmt determines whether a given ALTER TABLE statement
+ * involves a distributed table. If so (and if the statement does not use
+ * unsupported options), it modifies the input statement to ensure proper
+ * execution against the master node table and creates a DDLJob to encapsulate
+ * information needed during the worker node portion of DDL execution before
+ * returning that DDLJob in a List. If no distributed table is involved, this
+ * function returns NIL.
+ */
+List *
+PreprocessAlterTableStmt(Node *node, const char *alterTableCommand)
+{
+	AlterTableStmt *alterTableStatement = castNode(AlterTableStmt, node);
 
 	/* first check whether a distributed relation is affected */
 	if (alterTableStatement->relation == NULL)
@@ -268,8 +356,9 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 		return NIL;
 	}
 
-	lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
-	leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
+	LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
+	Oid leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
+
 	if (!OidIsValid(leftRelationId))
 	{
 		return NIL;
@@ -280,14 +369,24 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 	 * SET/SET storage parameters in Citus, so we might have to check for
 	 * another relation here.
 	 */
-	leftRelationKind = get_rel_relkind(leftRelationId);
+	char leftRelationKind = get_rel_relkind(leftRelationId);
 	if (leftRelationKind == RELKIND_INDEX)
 	{
-		leftRelationId = IndexGetRelation(leftRelationId, false);
+		bool missingOk = false;
+		leftRelationId = IndexGetRelation(leftRelationId, missingOk);
 	}
 
-	isDistributedRelation = IsDistributedTable(leftRelationId);
-	if (!isDistributedRelation)
+	/*
+	 * Normally, we would do this check in ErrorIfUnsupportedForeignConstraintExists
+	 * in post process step. However, we skip doing error checks in post process if
+	 * this pre process returns NIL -and this method returns NIL if the left relation
+	 * is a postgres table. So, we need to error out for foreign keys from postgres
+	 * tables to citus local tables here.
+	 */
+	ErrorIfAlterTableDefinesFKeyFromPostgresToCitusLocalTable(alterTableStatement);
+
+	bool referencingIsLocalTable = !IsCitusTable(leftRelationId);
+	if (referencingIsLocalTable)
 	{
 		return NIL;
 	}
@@ -308,17 +407,22 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 		ErrorIfUnsupportedAlterTableStmt(alterTableStatement);
 	}
 
-	/*
-	 * We check if there is a ADD/DROP FOREIGN CONSTRAINT command in sub commands list.
-	 * If there is we assign referenced relation id to rightRelationId and we also
-	 * set skip_validation to true to prevent PostgreSQL to verify validity of the
-	 * foreign constraint in master. Validity will be checked in workers anyway.
-	 */
-	commandList = alterTableStatement->cmds;
+	/* these will be set in below loop according to subcommands */
+	Oid rightRelationId = InvalidOid;
+	bool executeSequentially = false;
 
-	foreach(commandCell, commandList)
+	/*
+	 * We check if there is a ADD/DROP FOREIGN CONSTRAINT command in sub commands
+	 * list. If there is we assign referenced relation id to rightRelationId and
+	 * we also set skip_validation to true to prevent PostgreSQL to verify validity
+	 * of the foreign constraint in master. Validity will be checked in workers
+	 * anyway.
+	 */
+	List *commandList = alterTableStatement->cmds;
+
+	AlterTableCmd *command = NULL;
+	foreach_ptr(command, commandList)
 	{
-		AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
 		AlterTableType alterTableType = command->subtype;
 
 		if (alterTableType == AT_AddConstraint)
@@ -331,7 +435,7 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 				 * only subcommand of ALTER TABLE. It was already checked in
 				 * ErrorIfUnsupportedAlterTableStmt.
 				 */
-				Assert(list_length(commandList) <= 1);
+				Assert(list_length(commandList) == 1);
 
 				rightRelationId = RangeVarGetRelid(constraint->pktable, lockmode,
 												   alterTableStatement->missing_ok);
@@ -346,6 +450,24 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 				constraint->skip_validation = true;
 			}
 		}
+		else if (alterTableType == AT_DropConstraint)
+		{
+			char *constraintName = command->name;
+			if (ConstraintIsAForeignKey(constraintName, leftRelationId))
+			{
+				/*
+				 * We only support ALTER TABLE DROP CONSTRAINT ... FOREIGN KEY, if it is
+				 * only subcommand of ALTER TABLE. It was already checked in
+				 * ErrorIfUnsupportedAlterTableStmt.
+				 */
+				Assert(list_length(commandList) == 1);
+
+				bool missingOk = false;
+				Oid foreignKeyId = get_relation_constraint_oid(leftRelationId,
+															   constraintName, missingOk);
+				rightRelationId = GetReferencedTableId(foreignKeyId);
+			}
+		}
 		else if (alterTableType == AT_AddColumn)
 		{
 			/*
@@ -358,10 +480,9 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 			ColumnDef *columnDefinition = (ColumnDef *) command->def;
 			List *columnConstraints = columnDefinition->constraints;
 
-			ListCell *columnConstraint = NULL;
-			foreach(columnConstraint, columnConstraints)
+			Constraint *constraint = NULL;
+			foreach_ptr(constraint, columnConstraints)
 			{
-				Constraint *constraint = (Constraint *) lfirst(columnConstraint);
 				if (constraint->contype == CONSTR_FOREIGN)
 				{
 					rightRelationId = RangeVarGetRelid(constraint->pktable, lockmode,
@@ -396,7 +517,7 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 			 * is not distributed. Because, we'll manually convert the partition into
 			 * distributed table and co-locate with its parent.
 			 */
-			if (!IsDistributedTable(rightRelationId))
+			if (!IsCitusTable(rightRelationId))
 			{
 				return NIL;
 			}
@@ -413,20 +534,42 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 
 			rightRelationId = RangeVarGetRelid(partitionCommand->name, NoLock, false);
 		}
+		else if (AlterTableCommandTypeIsTrigger(alterTableType))
+		{
+			/*
+			 * We already error'ed out for ENABLE/DISABLE trigger commands for
+			 * other citus table types in ErrorIfUnsupportedAlterTableStmt.
+			 */
+			Assert(IsCitusTableType(leftRelationId, CITUS_LOCAL_TABLE));
 
+			char *triggerName = command->name;
+			return CitusLocalTableTriggerCommandDDLJob(leftRelationId, triggerName,
+													   alterTableCommand);
+		}
+
+		/*
+		 * We check and set the execution mode only if we fall into either of first two
+		 * conditional blocks, otherwise we already continue the loop
+		 */
 		executeSequentially |= SetupExecutionModeForAlterTable(leftRelationId,
 															   command);
 	}
 
-	ddlJob = palloc0(sizeof(DDLJob));
+	if (executeSequentially)
+	{
+		SetLocalMultiShardModifyModeToSequential();
+	}
+
+	/* fill them here as it is possible to use them in some conditional blocks below */
+	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 	ddlJob->targetRelationId = leftRelationId;
 	ddlJob->concurrentIndexCmd = false;
 	ddlJob->commandString = alterTableCommand;
-	ddlJob->executeSequentially = executeSequentially;
 
-	if (rightRelationId)
+	if (OidIsValid(rightRelationId))
 	{
-		if (!IsDistributedTable(rightRelationId))
+		bool referencedIsLocalTable = !IsCitusTable(rightRelationId);
+		if (referencedIsLocalTable)
 		{
 			ddlJob->taskList = NIL;
 		}
@@ -443,9 +586,188 @@ PlanAlterTableStmt(AlterTableStmt *alterTableStatement, const char *alterTableCo
 		ddlJob->taskList = DDLTaskList(leftRelationId, alterTableCommand);
 	}
 
-	ddlJobs = list_make1(ddlJob);
+	List *ddlJobs = list_make1(ddlJob);
 
 	return ddlJobs;
+}
+
+
+/*
+ * ErrorIfAlterTableDefinesFKeyFromPostgresToCitusLocalTable errors out if
+ * given ALTER TABLE statement defines foreign key from a postgres local table
+ * to a citus local table.
+ */
+static void
+ErrorIfAlterTableDefinesFKeyFromPostgresToCitusLocalTable(
+	AlterTableStmt *alterTableStatement)
+{
+	List *commandList = alterTableStatement->cmds;
+
+	LOCKMODE lockmode = AlterTableGetLockLevel(commandList);
+	Oid leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
+
+	if (IsCitusTable(leftRelationId))
+	{
+		/* left relation is not a postgres local table, */
+		return;
+	}
+
+	List *alterTableFKeyConstraints =
+		GetAlterTableStmtFKeyConstraintList(alterTableStatement);
+	Constraint *constraint = NULL;
+	foreach_ptr(constraint, alterTableFKeyConstraints)
+	{
+		Oid rightRelationId = RangeVarGetRelid(constraint->pktable, lockmode,
+											   alterTableStatement->missing_ok);
+		if (IsCitusTableType(rightRelationId, CITUS_LOCAL_TABLE))
+		{
+			ErrorOutForFKeyBetweenPostgresAndCitusLocalTable(leftRelationId);
+		}
+	}
+}
+
+
+/*
+ * GetAlterTableStmtFKeyConstraintList returns a list of Constraint objects for
+ * the foreign keys that given ALTER TABLE statement defines.
+ */
+static List *
+GetAlterTableStmtFKeyConstraintList(AlterTableStmt *alterTableStatement)
+{
+	List *alterTableFKeyConstraintList = NIL;
+
+	List *commandList = alterTableStatement->cmds;
+	AlterTableCmd *command = NULL;
+	foreach_ptr(command, commandList)
+	{
+		List *commandFKeyConstraintList = GetAlterTableCommandFKeyConstraintList(command);
+		alterTableFKeyConstraintList = list_concat(alterTableFKeyConstraintList,
+												   commandFKeyConstraintList);
+	}
+
+	return alterTableFKeyConstraintList;
+}
+
+
+/*
+ * GetAlterTableCommandFKeyConstraintList returns a list of Constraint objects
+ * for the foreign keys that given ALTER TABLE subcommand defines. Note that
+ * this is only possible if it is an:
+ *  - ADD CONSTRAINT subcommand (explicitly defines) or,
+ *  - ADD COLUMN subcommand (implicitly defines by adding a new column that
+ *    references to another table.
+ */
+static List *
+GetAlterTableCommandFKeyConstraintList(AlterTableCmd *command)
+{
+	List *fkeyConstraintList = NIL;
+
+	AlterTableType alterTableType = command->subtype;
+	if (alterTableType == AT_AddConstraint)
+	{
+		Constraint *constraint = (Constraint *) command->def;
+		if (constraint->contype == CONSTR_FOREIGN)
+		{
+			fkeyConstraintList = lappend(fkeyConstraintList, constraint);
+		}
+	}
+	else if (alterTableType == AT_AddColumn)
+	{
+		ColumnDef *columnDefinition = (ColumnDef *) command->def;
+		List *columnConstraints = columnDefinition->constraints;
+
+		Constraint *constraint = NULL;
+		foreach_ptr(constraint, columnConstraints)
+		{
+			if (constraint->contype == CONSTR_FOREIGN)
+			{
+				fkeyConstraintList = lappend(fkeyConstraintList, constraint);
+			}
+		}
+	}
+
+	return fkeyConstraintList;
+}
+
+
+/*
+ * AlterTableCommandTypeIsTrigger returns true if given alter table command type
+ * is identifies an ALTER TABLE .. TRIGGER .. command.
+ */
+static bool
+AlterTableCommandTypeIsTrigger(AlterTableType alterTableType)
+{
+	switch (alterTableType)
+	{
+		case AT_EnableTrig:
+		case AT_EnableAlwaysTrig:
+		case AT_EnableReplicaTrig:
+		case AT_EnableTrigUser:
+		case AT_DisableTrig:
+		case AT_DisableTrigUser:
+		case AT_EnableTrigAll:
+		case AT_DisableTrigAll:
+		{
+			return true;
+		}
+
+		default:
+			return false;
+	}
+}
+
+
+/*
+ * PreprocessAlterTableStmt issues a warning.
+ * ALTER TABLE ALL IN TABLESPACE statements have their node type as
+ * AlterTableMoveAllStmt. At the moment we do not support this functionality in
+ * the distributed environment. We warn out here.
+ */
+List *
+PreprocessAlterTableMoveAllStmt(Node *node, const char *queryString)
+{
+	ereport(WARNING, (errmsg("not propagating ALTER TABLE ALL IN TABLESPACE "
+							 "commands to worker nodes"),
+					  errhint("Connect to worker nodes directly to manually "
+							  "move all tables.")));
+
+	return NIL;
+}
+
+
+/*
+ * PreprocessAlterTableSchemaStmt is executed before the statement is applied
+ * to the local postgres instance.
+ *
+ * In this stage we can prepare the commands that will alter the schemas of the
+ * shards.
+ */
+List *
+PreprocessAlterTableSchemaStmt(Node *node, const char *queryString)
+{
+	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
+	Assert(stmt->objectType == OBJECT_TABLE);
+
+	if (stmt->relation == NULL)
+	{
+		return NIL;
+	}
+	ObjectAddress address = GetObjectAddressFromParseTree((Node *) stmt,
+														  stmt->missing_ok);
+	Oid relationId = address.objectId;
+
+	/* first check whether a distributed relation is affected */
+	if (!OidIsValid(relationId) || !IsCitusTable(relationId))
+	{
+		return NIL;
+	}
+	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
+	QualifyTreeNode((Node *) stmt);
+	ddlJob->targetRelationId = relationId;
+	ddlJob->concurrentIndexCmd = false;
+	ddlJob->commandString = DeparseTreeNode((Node *) stmt);
+	ddlJob->taskList = DDLTaskList(relationId, ddlJob->commandString);
+	return list_make1(ddlJob);
 }
 
 
@@ -458,27 +780,21 @@ Node *
 WorkerProcessAlterTableStmt(AlterTableStmt *alterTableStatement,
 							const char *alterTableCommand)
 {
-	LOCKMODE lockmode = 0;
-	Oid leftRelationId = InvalidOid;
-	bool isDistributedRelation = false;
-	List *commandList = NIL;
-	ListCell *commandCell = NULL;
-
 	/* first check whether a distributed relation is affected */
 	if (alterTableStatement->relation == NULL)
 	{
 		return (Node *) alterTableStatement;
 	}
 
-	lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
-	leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
+	LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
+	Oid leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
 	if (!OidIsValid(leftRelationId))
 	{
 		return (Node *) alterTableStatement;
 	}
 
-	isDistributedRelation = IsDistributedTable(leftRelationId);
-	if (!isDistributedRelation)
+	bool isCitusRelation = IsCitusTable(leftRelationId);
+	if (!isCitusRelation)
 	{
 		return (Node *) alterTableStatement;
 	}
@@ -489,11 +805,10 @@ WorkerProcessAlterTableStmt(AlterTableStmt *alterTableStatement,
 	 * set skip_validation to true to prevent PostgreSQL to verify validity of the
 	 * foreign constraint in master. Validity will be checked in workers anyway.
 	 */
-	commandList = alterTableStatement->cmds;
-
-	foreach(commandCell, commandList)
+	List *commandList = alterTableStatement->cmds;
+	AlterTableCmd *command = NULL;
+	foreach_ptr(command, commandList)
 	{
-		AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
 		AlterTableType alterTableType = command->subtype;
 
 		if (alterTableType == AT_AddConstraint)
@@ -524,12 +839,14 @@ IsAlterTableRenameStmt(RenameStmt *renameStmt)
 {
 	bool isAlterTableRenameStmt = false;
 
-	if (renameStmt->renameType == OBJECT_TABLE)
+	if (renameStmt->renameType == OBJECT_TABLE ||
+		renameStmt->renameType == OBJECT_FOREIGN_TABLE)
 	{
 		isAlterTableRenameStmt = true;
 	}
 	else if (renameStmt->renameType == OBJECT_COLUMN &&
-			 renameStmt->relationType == OBJECT_TABLE)
+			 (renameStmt->relationType == OBJECT_TABLE ||
+			  renameStmt->relationType == OBJECT_FOREIGN_TABLE))
 	{
 		isAlterTableRenameStmt = true;
 	}
@@ -550,35 +867,30 @@ IsAlterTableRenameStmt(RenameStmt *renameStmt)
 void
 ErrorIfAlterDropsPartitionColumn(AlterTableStmt *alterTableStatement)
 {
-	LOCKMODE lockmode = 0;
-	Oid leftRelationId = InvalidOid;
-	bool isDistributedRelation = false;
-	List *commandList = alterTableStatement->cmds;
-	ListCell *commandCell = NULL;
-
 	/* first check whether a distributed relation is affected */
 	if (alterTableStatement->relation == NULL)
 	{
 		return;
 	}
 
-	lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
-	leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
+	LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
+	Oid leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
 	if (!OidIsValid(leftRelationId))
 	{
 		return;
 	}
 
-	isDistributedRelation = IsDistributedTable(leftRelationId);
-	if (!isDistributedRelation)
+	bool isCitusRelation = IsCitusTable(leftRelationId);
+	if (!isCitusRelation)
 	{
 		return;
 	}
 
 	/* then check if any of subcommands drop partition column.*/
-	foreach(commandCell, commandList)
+	List *commandList = alterTableStatement->cmds;
+	AlterTableCmd *command = NULL;
+	foreach_ptr(command, commandList)
 	{
-		AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
 		AlterTableType alterTableType = command->subtype;
 		if (alterTableType == AT_DropColumn)
 		{
@@ -593,42 +905,44 @@ ErrorIfAlterDropsPartitionColumn(AlterTableStmt *alterTableStatement)
 
 
 /*
- * PostProcessAlterTableStmt runs after the ALTER TABLE command has already run on the
- * master, so we are checking constraints over the table with constraints already defined
- * (to make the constraint check process same for ALTER TABLE and CREATE TABLE). If
- * constraints do not fulfill the rules we defined, they will be removed and the table
- * will return back to the state before the ALTER TABLE command.
+ * PostprocessAlterTableStmt runs after the ALTER TABLE command has already run
+ * on the master, so we are checking constraints over the table with constraints
+ * already defined (to make the constraint check process same for ALTER TABLE and
+ * CREATE TABLE). If constraints do not fulfill the rules we defined, they will be
+ * removed and the table will return back to the state before the ALTER TABLE command.
  */
 void
-PostProcessAlterTableStmt(AlterTableStmt *alterTableStatement)
+PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 {
-	List *commandList = alterTableStatement->cmds;
-	ListCell *commandCell = NULL;
+	LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
+	Oid relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
 
-	foreach(commandCell, commandList)
+	if (relationId != InvalidOid)
 	{
-		AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
+		/* changing a relation could introduce new dependencies */
+		ObjectAddress tableAddress = { 0 };
+		ObjectAddressSet(tableAddress, RelationRelationId, relationId);
+		EnsureDependenciesExistOnAllNodes(&tableAddress);
+	}
+
+	List *commandList = alterTableStatement->cmds;
+	AlterTableCmd *command = NULL;
+	foreach_ptr(command, commandList)
+	{
 		AlterTableType alterTableType = command->subtype;
 
 		if (alterTableType == AT_AddConstraint)
 		{
-			LOCKMODE lockmode = NoLock;
-			Oid relationId = InvalidOid;
-			Constraint *constraint = NULL;
-
 			Assert(list_length(commandList) == 1);
 
 			ErrorIfUnsupportedAlterAddConstraintStmt(alterTableStatement);
-
-			lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
-			relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
 
 			if (!OidIsValid(relationId))
 			{
 				continue;
 			}
 
-			constraint = (Constraint *) command->def;
+			Constraint *constraint = (Constraint *) command->def;
 			if (constraint->contype == CONSTR_FOREIGN)
 			{
 				InvalidateForeignKeyGraph();
@@ -636,29 +950,21 @@ PostProcessAlterTableStmt(AlterTableStmt *alterTableStatement)
 		}
 		else if (alterTableType == AT_AddColumn)
 		{
-			List *columnConstraints = NIL;
-			ListCell *columnConstraint = NULL;
-			Oid relationId = InvalidOid;
-			LOCKMODE lockmode = NoLock;
-
 			ColumnDef *columnDefinition = (ColumnDef *) command->def;
-			columnConstraints = columnDefinition->constraints;
+			List *columnConstraints = columnDefinition->constraints;
 			if (columnConstraints)
 			{
 				ErrorIfUnsupportedAlterAddConstraintStmt(alterTableStatement);
 			}
 
-			lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
-			relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
 			if (!OidIsValid(relationId))
 			{
 				continue;
 			}
 
-			foreach(columnConstraint, columnConstraints)
+			Constraint *constraint = NULL;
+			foreach_ptr(constraint, columnConstraints)
 			{
-				Constraint *constraint = (Constraint *) lfirst(columnConstraint);
-
 				if (constraint->conname == NULL &&
 					(constraint->contype == CONSTR_PRIMARY ||
 					 constraint->contype == CONSTR_UNIQUE ||
@@ -757,8 +1063,8 @@ ErrorUnsupportedAlterTableAddColumn(Oid relationId, AlterTableCmd *command,
 }
 
 
-/*ErrorIfUnsupportedConstraint
- *  run checks related to unique index / exclude
+/*
+ * ErrorIfUnsupportedConstraint runs checks related to unique index / exclude
  * constraints.
  *
  * The function skips the uniqeness checks for reference tables (i.e., distribution
@@ -777,21 +1083,20 @@ ErrorUnsupportedAlterTableAddColumn(Oid relationId, AlterTableCmd *command,
  */
 void
 ErrorIfUnsupportedConstraint(Relation relation, char distributionMethod,
+							 char referencingReplicationModel,
 							 Var *distributionColumn, uint32 colocationId)
 {
-	char *relationName = NULL;
-	List *indexOidList = NULL;
-	ListCell *indexOidCell = NULL;
-
 	/*
-	 * We first perform check for foreign constraints. It is important to do this check
-	 * before next check, because other types of constraints are allowed on reference
-	 * tables and we return early for those constraints thanks to next check. Therefore,
-	 * for reference tables, we first check for foreing constraints and if they are OK,
-	 * we do not error out for other types of constraints.
+	 * We first perform check for foreign constraints. It is important to do this
+	 * check before next check, because other types of constraints are allowed on
+	 * reference tables and we return early for those constraints thanks to next
+	 * check. Therefore, for reference tables, we first check for foreign constraints
+	 * and if they are OK, we do not error out for other types of constraints.
 	 */
-	ErrorIfUnsupportedForeignConstraint(relation, distributionMethod, distributionColumn,
-										colocationId);
+	ErrorIfUnsupportedForeignConstraintExists(relation, distributionMethod,
+											  referencingReplicationModel,
+											  distributionColumn,
+											  colocationId);
 
 	/*
 	 * Citus supports any kind of uniqueness constraints for reference tables
@@ -803,21 +1108,23 @@ ErrorIfUnsupportedConstraint(Relation relation, char distributionMethod,
 		return;
 	}
 
-	relationName = RelationGetRelationName(relation);
-	indexOidList = RelationGetIndexList(relation);
-
-	foreach(indexOidCell, indexOidList)
+	if (distributionColumn == NULL)
 	{
-		Oid indexOid = lfirst_oid(indexOidCell);
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("distribution column of distributed table is NULL")));
+	}
+
+	char *relationName = RelationGetRelationName(relation);
+	List *indexOidList = RelationGetIndexList(relation);
+
+	Oid indexOid = InvalidOid;
+	foreach_oid(indexOid, indexOidList)
+	{
 		Relation indexDesc = index_open(indexOid, RowExclusiveLock);
-		IndexInfo *indexInfo = NULL;
-		AttrNumber *attributeNumberArray = NULL;
 		bool hasDistributionColumn = false;
-		int attributeCount = 0;
-		int attributeIndex = 0;
 
 		/* extract index key information from the index's pg_index info */
-		indexInfo = BuildIndexInfo(indexDesc);
+		IndexInfo *indexInfo = BuildIndexInfo(indexDesc);
 
 		/* only check unique indexes and exclusion constraints. */
 		if (indexInfo->ii_Unique == false && indexInfo->ii_ExclusionOps == NULL)
@@ -842,25 +1149,23 @@ ErrorIfUnsupportedConstraint(Relation relation, char distributionMethod,
 							  errhint("Consider using hash partitioning.")));
 		}
 
-		attributeCount = indexInfo->ii_NumIndexAttrs;
-		attributeNumberArray = IndexInfoAttributeNumberArray(indexInfo);
+		int attributeCount = indexInfo->ii_NumIndexAttrs;
+		AttrNumber *attributeNumberArray = indexInfo->ii_IndexAttrNumbers;
 
-		for (attributeIndex = 0; attributeIndex < attributeCount; attributeIndex++)
+		for (int attributeIndex = 0; attributeIndex < attributeCount; attributeIndex++)
 		{
 			AttrNumber attributeNumber = attributeNumberArray[attributeIndex];
-			bool uniqueConstraint = false;
-			bool exclusionConstraintWithEquality = false;
 
 			if (distributionColumn->varattno != attributeNumber)
 			{
 				continue;
 			}
 
-			uniqueConstraint = indexInfo->ii_Unique;
-			exclusionConstraintWithEquality = (indexInfo->ii_ExclusionOps != NULL &&
-											   OperatorImplementsEquality(
-												   indexInfo->ii_ExclusionOps[
-													   attributeIndex]));
+			bool uniqueConstraint = indexInfo->ii_Unique;
+			bool exclusionConstraintWithEquality = (indexInfo->ii_ExclusionOps != NULL &&
+													OperatorImplementsEquality(
+														indexInfo->ii_ExclusionOps[
+															attributeIndex]));
 
 			if (uniqueConstraint || exclusionConstraintWithEquality)
 			{
@@ -871,13 +1176,14 @@ ErrorIfUnsupportedConstraint(Relation relation, char distributionMethod,
 
 		if (!hasDistributionColumn)
 		{
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("cannot create constraint on \"%s\"",
-								   relationName),
-							errdetail("Distributed relations cannot have UNIQUE, "
-									  "EXCLUDE, or PRIMARY KEY constraints that do not "
-									  "include the partition column (with an equality "
-									  "operator if EXCLUDE).")));
+			ereport(ERROR, (
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot create constraint on \"%s\"",
+							   relationName),
+						errdetail("Distributed relations cannot have UNIQUE, "
+								  "EXCLUDE, or PRIMARY KEY constraints that do not "
+								  "include the partition column (with an equality "
+								  "operator if EXCLUDE).")));
 		}
 
 		index_close(indexDesc, NoLock);
@@ -898,17 +1204,20 @@ ErrorIfUnsupportedConstraint(Relation relation, char distributionMethod,
  * ALTER TABLE REPLICA IDENTITY
  * ALTER TABLE SET ()
  * ALTER TABLE RESET ()
+ * ALTER TABLE ENABLE/DISABLE TRIGGER (only for citus local tables)
  */
 static void
 ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 {
 	List *commandList = alterTableStatement->cmds;
-	ListCell *commandCell = NULL;
+
+	LOCKMODE lockmode = AlterTableGetLockLevel(commandList);
+	Oid relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
 
 	/* error out if any of the subcommands are unsupported */
-	foreach(commandCell, commandList)
+	AlterTableCmd *command = NULL;
+	foreach_ptr(command, commandList)
 	{
-		AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
 		AlterTableType alterTableType = command->subtype;
 
 		switch (alterTableType)
@@ -987,12 +1296,10 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 
 			case AT_AttachPartition:
 			{
-				Oid relationId = AlterTableLookupRelation(alterTableStatement,
-														  NoLock);
 				PartitionCmd *partitionCommand = (PartitionCmd *) command->def;
 				bool missingOK = false;
 				Oid partitionRelationId = RangeVarGetRelid(partitionCommand->name,
-														   NoLock, missingOK);
+														   lockmode, missingOK);
 
 				/* we only allow partitioning commands if they are only subcommand */
 				if (commandList->length > 1)
@@ -1004,7 +1311,9 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 											"separately.")));
 				}
 
-				if (IsDistributedTable(partitionRelationId) &&
+				ErrorIfCitusLocalTablePartitionCommand(command, relationId);
+
+				if (IsCitusTable(partitionRelationId) &&
 					!TablesColocated(relationId, partitionRelationId))
 				{
 					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1028,14 +1337,13 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 											"separately.")));
 				}
 
+				ErrorIfCitusLocalTablePartitionCommand(command, relationId);
+
 				break;
 			}
 
 			case AT_DropConstraint:
 			{
-				LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
-				Oid relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
-
 				if (!OidIsValid(relationId))
 				{
 					return;
@@ -1049,17 +1357,41 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 				break;
 			}
 
-			case AT_SetNotNull:
+			case AT_EnableTrig:
+			case AT_EnableAlwaysTrig:
+			case AT_EnableReplicaTrig:
+			case AT_EnableTrigUser:
+			case AT_DisableTrig:
+			case AT_DisableTrigUser:
 			case AT_EnableTrigAll:
 			case AT_DisableTrigAll:
+			{
+				/*
+				 * Postgres already does not allow executing ALTER TABLE TRIGGER
+				 * commands with other subcommands, but let's be on the safe side.
+				 */
+				if (commandList->length > 1)
+				{
+					ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+									errmsg("cannot execute ENABLE/DISABLE TRIGGER "
+										   "command with other subcommands"),
+									errhint("You can issue each subcommand separately")));
+				}
+
+				ErrorOutForTriggerIfNotCitusLocalTable(relationId);
+
+				break;
+			}
+
+			case AT_SetNotNull:
 			case AT_ReplicaIdentity:
 			case AT_ValidateConstraint:
 			{
 				/*
-				 * We will not perform any special check for ALTER TABLE DROP CONSTRAINT
-				 * , ALTER TABLE .. ALTER COLUMN .. SET NOT NULL and ALTER TABLE ENABLE/
-				 * DISABLE TRIGGER ALL, ALTER TABLE .. REPLICA IDENTITY .., ALTER TABLE
-				 * .. VALIDATE CONSTRAINT ..
+				 * We will not perform any special check for:
+				 * ALTER TABLE .. ALTER COLUMN .. SET NOT NULL
+				 * ALTER TABLE .. REPLICA IDENTITY ..
+				 * ALTER TABLE .. VALIDATE CONSTRAINT ..
 				 */
 				break;
 			}
@@ -1089,11 +1421,57 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 
 
 /*
+ * ErrorIfCitusLocalTablePartitionCommand errors out if given alter table subcommand is
+ * an ALTER TABLE ATTACH / DETACH PARTITION command run for a citus local table.
+ */
+static void
+ErrorIfCitusLocalTablePartitionCommand(AlterTableCmd *alterTableCmd, Oid parentRelationId)
+{
+	AlterTableType alterTableType = alterTableCmd->subtype;
+	if (alterTableType != AT_AttachPartition && alterTableType != AT_DetachPartition)
+	{
+		return;
+	}
+
+	bool missingOK = false;
+	Oid childRelationId = GetPartitionCommandChildRelationId(alterTableCmd, missingOK);
+	if (!IsCitusTableType(parentRelationId, CITUS_LOCAL_TABLE) &&
+		!IsCitusTableType(childRelationId, CITUS_LOCAL_TABLE))
+	{
+		return;
+	}
+
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot execute ATTACH/DETACH PARTITION command as "
+						   "citus local tables cannot be involved in partition "
+						   "relationships with other tables")));
+}
+
+
+/*
+ * GetPartitionCommandChildRelationId returns child relationId for given
+ * ALTER TABLE ATTACH / DETACH PARTITION subcommand.
+ */
+static Oid
+GetPartitionCommandChildRelationId(AlterTableCmd *alterTableCmd, bool missingOk)
+{
+	AlterTableType alterTableType PG_USED_FOR_ASSERTS_ONLY = alterTableCmd->subtype;
+	Assert(alterTableType == AT_AttachPartition || alterTableType == AT_DetachPartition);
+
+	PartitionCmd *partitionCommand = (PartitionCmd *) alterTableCmd->def;
+	RangeVar *childRelationRangeVar = partitionCommand->name;
+	Oid childRelationId = RangeVarGetRelid(childRelationRangeVar, AccessExclusiveLock,
+										   missingOk);
+	return childRelationId;
+}
+
+
+/*
  * SetupExecutionModeForAlterTable is the function that is responsible
- * for two things for practial purpose for not doing the same checks
+ * for two things for practical purpose for not doing the same checks
  * twice:
  *     (a) For any command, decide and return whether we should
- *         run the command in sequntial mode
+ *         run the command in sequential mode
  *     (b) For commands in a transaction block, set the transaction local
  *         multi-shard modify mode to sequential when necessary
  *
@@ -1136,16 +1514,14 @@ SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *command)
 		ColumnDef *columnDefinition = (ColumnDef *) command->def;
 		List *columnConstraints = columnDefinition->constraints;
 
-		ListCell *columnConstraint = NULL;
-		foreach(columnConstraint, columnConstraints)
+		Constraint *constraint = NULL;
+		foreach_ptr(constraint, columnConstraints)
 		{
-			Constraint *constraint = (Constraint *) lfirst(columnConstraint);
 			if (constraint->contype == CONSTR_FOREIGN)
 			{
 				Oid rightRelationId = RangeVarGetRelid(constraint->pktable, NoLock,
 													   false);
-				if (IsDistributedTable(rightRelationId) &&
-					PartitionMethod(rightRelationId) == DISTRIBUTE_BY_NONE)
+				if (IsCitusTableType(rightRelationId, REFERENCE_TABLE))
 				{
 					executeSequentially = true;
 				}
@@ -1159,7 +1535,7 @@ SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *command)
 		if (ColumnAppearsInForeignKeyToReferenceTable(affectedColumnName,
 													  relationId))
 		{
-			if (IsTransactionBlock() && alterTableType == AT_AlterColumnType)
+			if (alterTableType == AT_AlterColumnType)
 			{
 				SetLocalMultiShardModifyModeToSequential();
 			}
@@ -1180,11 +1556,18 @@ SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *command)
 		{
 			Oid rightRelationId = RangeVarGetRelid(constraint->pktable, NoLock,
 												   false);
-			if (IsDistributedTable(rightRelationId) &&
-				PartitionMethod(rightRelationId) == DISTRIBUTE_BY_NONE)
+			if (IsCitusTableType(rightRelationId, REFERENCE_TABLE))
 			{
 				executeSequentially = true;
 			}
+		}
+	}
+	else if (alterTableType == AT_DetachPartition || alterTableType == AT_AttachPartition)
+	{
+		/* check if there are foreign constraints to reference tables */
+		if (HasForeignKeyToReferenceTable(relationId))
+		{
+			executeSequentially = true;
 		}
 	}
 
@@ -1194,8 +1577,8 @@ SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *command)
 	 * the distributed tables, thus contradicting our purpose of using
 	 * sequential mode.
 	 */
-	if (executeSequentially && IsDistributedTable(relationId) &&
-		PartitionMethod(relationId) != DISTRIBUTE_BY_NONE &&
+	if (executeSequentially &&
+		!IsCitusTableType(relationId, CITUS_TABLE_WITH_NO_DIST_KEY) &&
 		ParallelQueryExecutedInTransaction())
 	{
 		char *relationName = get_rel_name(relationId);
@@ -1229,88 +1612,141 @@ static List *
 InterShardDDLTaskList(Oid leftRelationId, Oid rightRelationId,
 					  const char *commandString)
 {
-	List *taskList = NIL;
-
 	List *leftShardList = LoadShardIntervalList(leftRelationId);
-	ListCell *leftShardCell = NULL;
+	List *rightShardList = CreateRightShardListForInterShardDDLTask(rightRelationId,
+																	leftRelationId,
+																	leftShardList);
+
+	/* lock metadata before getting placement lists */
+	LockShardListMetadata(leftShardList, ShareLock);
+
+	uint64 jobId = INVALID_JOB_ID;
+	int taskId = 1;
+
 	Oid leftSchemaId = get_rel_namespace(leftRelationId);
 	char *leftSchemaName = get_namespace_name(leftSchemaId);
 	char *escapedLeftSchemaName = quote_literal_cstr(leftSchemaName);
 
-	char rightPartitionMethod = PartitionMethod(rightRelationId);
-	List *rightShardList = LoadShardIntervalList(rightRelationId);
-	ListCell *rightShardCell = NULL;
 	Oid rightSchemaId = get_rel_namespace(rightRelationId);
 	char *rightSchemaName = get_namespace_name(rightSchemaId);
 	char *escapedRightSchemaName = quote_literal_cstr(rightSchemaName);
 
 	char *escapedCommandString = quote_literal_cstr(commandString);
-	uint64 jobId = INVALID_JOB_ID;
-	int taskId = 1;
 
-	/*
-	 * If the rightPartitionMethod is a reference table, we need to make sure
-	 * that the tasks are created in a way that the right shard stays the same
-	 * since we only have one placement per worker. This hack is first implemented
-	 * for foreign constraint support from distributed tables to reference tables.
-	 */
-	if (rightPartitionMethod == DISTRIBUTE_BY_NONE)
-	{
-		ShardInterval *rightShardInterval = NULL;
-		int rightShardCount = list_length(rightShardList);
-		int leftShardCount = list_length(leftShardList);
-		int shardCounter = 0;
+	List *taskList = NIL;
 
-		Assert(rightShardCount == 1);
-
-		rightShardInterval = (ShardInterval *) linitial(rightShardList);
-		for (shardCounter = rightShardCount; shardCounter < leftShardCount;
-			 shardCounter++)
-		{
-			rightShardList = lappend(rightShardList, rightShardInterval);
-		}
-	}
-
-	/* lock metadata before getting placement lists */
-	LockShardListMetadata(leftShardList, ShareLock);
-
+	ListCell *leftShardCell = NULL;
+	ListCell *rightShardCell = NULL;
 	forboth(leftShardCell, leftShardList, rightShardCell, rightShardList)
 	{
 		ShardInterval *leftShardInterval = (ShardInterval *) lfirst(leftShardCell);
-		uint64 leftShardId = leftShardInterval->shardId;
-		StringInfo applyCommand = makeStringInfo();
-		Task *task = NULL;
-		RelationShard *leftRelationShard = CitusMakeNode(RelationShard);
-		RelationShard *rightRelationShard = CitusMakeNode(RelationShard);
-
 		ShardInterval *rightShardInterval = (ShardInterval *) lfirst(rightShardCell);
+
+		uint64 leftShardId = leftShardInterval->shardId;
 		uint64 rightShardId = rightShardInterval->shardId;
 
-		leftRelationShard->relationId = leftRelationId;
-		leftRelationShard->shardId = leftShardId;
-
-		rightRelationShard->relationId = rightRelationId;
-		rightRelationShard->shardId = rightShardId;
-
+		StringInfo applyCommand = makeStringInfo();
 		appendStringInfo(applyCommand, WORKER_APPLY_INTER_SHARD_DDL_COMMAND,
 						 leftShardId, escapedLeftSchemaName, rightShardId,
 						 escapedRightSchemaName, escapedCommandString);
 
-		task = CitusMakeNode(Task);
+		Task *task = CitusMakeNode(Task);
 		task->jobId = jobId;
 		task->taskId = taskId++;
 		task->taskType = DDL_TASK;
-		task->queryString = applyCommand->data;
-		task->dependedTaskList = NULL;
+		SetTaskQueryString(task, applyCommand->data);
+		task->dependentTaskList = NULL;
 		task->replicationModel = REPLICATION_MODEL_INVALID;
 		task->anchorShardId = leftShardId;
-		task->taskPlacementList = FinalizedShardPlacementList(leftShardId);
-		task->relationShardList = list_make2(leftRelationShard, rightRelationShard);
+		SetInterShardDDLTaskPlacementList(task, leftShardInterval, rightShardInterval);
+		SetInterShardDDLTaskRelationShardList(task, leftShardInterval,
+											  rightShardInterval);
 
 		taskList = lappend(taskList, task);
 	}
 
 	return taskList;
+}
+
+
+/*
+ * CreateRightShardListForInterShardDDLTask is a helper function that creates
+ * shard list for the right relation for InterShardDDLTaskList.
+ */
+static List *
+CreateRightShardListForInterShardDDLTask(Oid rightRelationId, Oid leftRelationId,
+										 List *leftShardList)
+{
+	List *rightShardList = LoadShardIntervalList(rightRelationId);
+
+
+	if (!IsCitusTableType(leftRelationId, CITUS_LOCAL_TABLE) &&
+		IsCitusTableType(rightRelationId, REFERENCE_TABLE))
+	{
+		/*
+		 * If the right relation is a reference table and left relation is not
+		 * a citus local table, we need to make sure that the tasks are created
+		 * in a way that the right shard stays the same since we only have one
+		 * placement per worker.
+		 * If left relation is a citus local table, then we don't need to populate
+		 * reference table shards as we will execute ADD/DROP constraint command
+		 * only for coordinator placement of reference table.
+		 */
+		ShardInterval *rightShard = (ShardInterval *) linitial(rightShardList);
+		int leftShardCount = list_length(leftShardList);
+		rightShardList = GenerateListFromElement(rightShard, leftShardCount);
+	}
+
+	return rightShardList;
+}
+
+
+/*
+ * SetInterShardDDLTaskPlacementList sets taskPlacementList field of given
+ * inter-shard DDL task according to passed shard interval arguments.
+ */
+static void
+SetInterShardDDLTaskPlacementList(Task *task, ShardInterval *leftShardInterval,
+								  ShardInterval *rightShardInterval)
+{
+	Oid leftRelationId = leftShardInterval->relationId;
+	Oid rightRelationId = rightShardInterval->relationId;
+	if (IsCitusTableType(leftRelationId, REFERENCE_TABLE) &&
+		IsCitusTableType(rightRelationId, CITUS_LOCAL_TABLE))
+	{
+		/*
+		 * If we are defining/dropping a foreign key from a reference table
+		 * to a citus local table, then we will execute ADD/DROP constraint
+		 * command only for coordinator placement of reference table.
+		 */
+		task->taskPlacementList = GroupShardPlacementsForTableOnGroup(leftRelationId,
+																	  COORDINATOR_GROUP_ID);
+	}
+	else
+	{
+		uint64 leftShardId = leftShardInterval->shardId;
+		task->taskPlacementList = ActiveShardPlacementList(leftShardId);
+	}
+}
+
+
+/*
+ * SetInterShardDDLTaskRelationShardList sets relationShardList field of given
+ * inter-shard DDL task according to passed shard interval arguments.
+ */
+static void
+SetInterShardDDLTaskRelationShardList(Task *task, ShardInterval *leftShardInterval,
+									  ShardInterval *rightShardInterval)
+{
+	RelationShard *leftRelationShard = CitusMakeNode(RelationShard);
+	leftRelationShard->relationId = leftShardInterval->relationId;
+	leftRelationShard->shardId = leftShardInterval->shardId;
+
+	RelationShard *rightRelationShard = CitusMakeNode(RelationShard);
+	rightRelationShard->relationId = rightShardInterval->relationId;
+	rightRelationShard->shardId = rightShardInterval->shardId;
+
+	task->relationShardList = list_make2(leftRelationShard, rightRelationShard);
 }
 
 
@@ -1323,8 +1759,6 @@ AlterInvolvesPartitionColumn(AlterTableStmt *alterTableStatement,
 							 AlterTableCmd *command)
 {
 	bool involvesPartitionColumn = false;
-	Var *partitionColumn = NULL;
-	HeapTuple tuple = NULL;
 	char *alterColumnName = command->name;
 
 	LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
@@ -1334,9 +1768,9 @@ AlterInvolvesPartitionColumn(AlterTableStmt *alterTableStatement,
 		return false;
 	}
 
-	partitionColumn = DistPartitionKey(relationId);
+	Var *partitionColumn = DistPartitionKey(relationId);
 
-	tuple = SearchSysCacheAttName(relationId, alterColumnName);
+	HeapTuple tuple = SearchSysCacheAttName(relationId, alterColumnName);
 	if (HeapTupleIsValid(tuple))
 	{
 		Form_pg_attribute targetAttr = (Form_pg_attribute) GETSTRUCT(tuple);
@@ -1365,11 +1799,94 @@ ErrorIfUnsupportedAlterAddConstraintStmt(AlterTableStmt *alterTableStatement)
 	LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
 	Oid relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
 	char distributionMethod = PartitionMethod(relationId);
+	char referencingReplicationModel = TableReplicationModel(relationId);
 	Var *distributionColumn = DistPartitionKey(relationId);
 	uint32 colocationId = TableColocationId(relationId);
 	Relation relation = relation_open(relationId, ExclusiveLock);
 
-	ErrorIfUnsupportedConstraint(relation, distributionMethod, distributionColumn,
-								 colocationId);
+	ErrorIfUnsupportedConstraint(relation, distributionMethod,
+								 referencingReplicationModel,
+								 distributionColumn, colocationId);
 	relation_close(relation, NoLock);
+}
+
+
+/*
+ * AlterTableSchemaStmtObjectAddress returns the ObjectAddress of the table that
+ * is the object of the AlterObjectSchemaStmt.
+ *
+ * This could be called both before or after it has been applied locally. It will
+ * look in the old schema first, if the table cannot be found in that schema it
+ * will look in the new schema. Errors if missing_ok is false and the table cannot
+ * be found in either of the schemas.
+ */
+ObjectAddress
+AlterTableSchemaStmtObjectAddress(Node *node, bool missing_ok)
+{
+	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
+	Assert(stmt->objectType == OBJECT_TABLE);
+
+	const char *tableName = stmt->relation->relname;
+	Oid tableOid = InvalidOid;
+	if (stmt->relation->schemaname)
+	{
+		const char *schemaName = stmt->relation->schemaname;
+		Oid schemaOid = get_namespace_oid(schemaName, missing_ok);
+		tableOid = get_relname_relid(tableName, schemaOid);
+	}
+	else
+	{
+		tableOid = RelnameGetRelid(stmt->relation->relname);
+	}
+
+	if (tableOid == InvalidOid)
+	{
+		const char *newSchemaName = stmt->newschema;
+		Oid newSchemaOid = get_namespace_oid(newSchemaName, true);
+		tableOid = get_relname_relid(tableName, newSchemaOid);
+
+		if (!missing_ok && tableOid == InvalidOid)
+		{
+			const char *quotedTableName =
+				quote_qualified_identifier(stmt->relation->schemaname, tableName);
+
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE),
+							errmsg("relation \"%s\" does not exist",
+								   quotedTableName)));
+		}
+	}
+
+	ObjectAddress address = { 0 };
+	ObjectAddressSet(address, RelationRelationId, tableOid);
+
+	return address;
+}
+
+
+/*
+ * MakeNameListFromRangeVar makes a namelist from a RangeVar. Its behaviour
+ * should be the exact opposite of postgres' makeRangeVarFromNameList.
+ */
+List *
+MakeNameListFromRangeVar(const RangeVar *rel)
+{
+	if (rel->catalogname != NULL)
+	{
+		Assert(rel->schemaname != NULL);
+		Assert(rel->relname != NULL);
+		return list_make3(makeString(rel->catalogname),
+						  makeString(rel->schemaname),
+						  makeString(rel->relname));
+	}
+	else if (rel->schemaname != NULL)
+	{
+		Assert(rel->relname != NULL);
+		return list_make2(makeString(rel->schemaname),
+						  makeString(rel->relname));
+	}
+	else
+	{
+		Assert(rel->relname != NULL);
+		return list_make1(makeString(rel->relname));
+	}
 }

@@ -228,19 +228,7 @@ ERROR:  hash partitioned table has overlapping shards
 UPDATE pg_dist_shard SET shardminvalue = '-2147483648' WHERE shardid = 1260006;
 UPDATE pg_dist_shard SET shardmaxvalue = '-1073741825' WHERE shardid = 1260006;
 -- empty tables
-SELECT master_modify_multiple_shards('DELETE FROM multi_outer_join_left_hash');
- master_modify_multiple_shards 
--------------------------------
-                            20
-(1 row)
-
-SELECT master_modify_multiple_shards('DELETE FROM multi_outer_join_right_hash');
- master_modify_multiple_shards 
--------------------------------
-                            45
-(1 row)
-
-DELETE FROM multi_outer_join_right_reference;
+TRUNCATE multi_outer_join_left_hash, multi_outer_join_right_hash, multi_outer_join_right_reference;
 -- reload shards with 1-1 matching
 \copy multi_outer_join_left_hash FROM '@abs_srcdir@/data/customer-1-15.data' with delimiter '|'
 \copy multi_outer_join_left_hash FROM '@abs_srcdir@/data/customer-21-30.data' with delimiter '|'
@@ -264,7 +252,7 @@ SELECT
 	count(*)
 FROM
 	multi_outer_join_left_hash a LEFT JOIN multi_outer_join_right_hash b ON (l_nationkey = r_nationkey);
-ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+ERROR:  complex joins are only supported when all distributed tables are co-located and joined on their distribution columns
 -- Anti-join should return customers for which there is no row in the right table
 SELECT
 	min(l_custkey), max(l_custkey)
@@ -338,7 +326,7 @@ FROM
 	LEFT JOIN multi_outer_join_right_reference r1 ON (l1.l_custkey = r1.r_custkey)
 	LEFT JOIN multi_outer_join_right_reference r2 ON (l1.l_custkey  = r2.r_custkey)
 	RIGHT JOIN multi_outer_join_left_hash l2 ON (r2.r_custkey = l2.l_custkey);
-ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+ERROR:  complex joins are only supported when all distributed tables are co-located and joined on their distribution columns
 -- add an anti-join, this should also error out
 SELECT
 	*
@@ -349,7 +337,7 @@ FROM
 	RIGHT JOIN multi_outer_join_left_hash l2 ON (r2.r_custkey = l2.l_custkey)
 WHERE
 	r1.r_custkey is NULL;
-ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+ERROR:  complex joins are only supported when all distributed tables are co-located and joined on their distribution columns
 -- Three way join 2-1-1 (broadcast + broadcast join) should work
 SELECT
 	l_custkey, r_custkey, t_custkey

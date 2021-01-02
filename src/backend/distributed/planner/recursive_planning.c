@@ -18,15 +18,12 @@
  *   These queries can use nearly all SQL features, but only if they have
  *   a single-valued filter on the distribution column.
  *
- * - Real-time queries that can be executed by performing a task for each
+ * - Multi-shard queries that can be executed by performing a task for each
  *   shard in a distributed table and performing a merge step.
  *
  *   These queries have limited SQL support. They may only include
  *   subqueries if the subquery can be executed on each shard by replacing
  *   table names with shard names and concatenating the result.
- *
- * - Task-tracker queries that can be executed through a tree of
- *   re-partitioning operations.
  *
  *   These queries have very limited SQL support and only support basic
  *   inner joins and subqueries without joins.
@@ -45,11 +42,15 @@
  * replaced then what remains is a router query which can use nearly all
  * SQL features.
  *
- * Copyright (c) 2017, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
+
+#include "funcapi.h"
 
 #include "catalog/pg_type.h"
 #include "catalog/pg_class.h"
@@ -58,43 +59,63 @@
 #include "distributed/commands/multi_copy.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/errormessage.h"
+#include "distributed/local_distributed_join_planner.h"
+#include "distributed/listutils.h"
+#include "distributed/log_utils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_logical_planner.h"
+#include "distributed/multi_logical_optimizer.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/query_colocation_checker.h"
+#include "distributed/query_pushdown_planning.h"
 #include "distributed/recursive_planning.h"
 #include "distributed/relation_restriction_equivalence.h"
+#include "distributed/log_utils.h"
+#include "distributed/shard_pruning.h"
+#include "distributed/version_compat.h"
 #include "lib/stringinfo.h"
+#include "optimizer/clauses.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "optimizer/optimizer.h"
+#else
+#include "optimizer/var.h"
+#endif
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
 #include "parser/parsetree.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "nodes/pathnodes.h"
+#else
 #include "nodes/relation.h"
+#endif
 #include "utils/builtins.h"
 #include "utils/guc.h"
-#include "../../../include/distributed/query_pushdown_planning.h"
-
+#include "utils/lsyscache.h"
 
 /*
  * RecursivePlanningContext is used to recursively plan subqueries
  * and CTEs, pull results to the coordinator, and push it back into
  * the workers.
  */
-typedef struct RecursivePlanningContext
+struct RecursivePlanningContextInternal
 {
 	int level;
 	uint64 planId;
 	bool allDistributionKeysInQueryAreEqual; /* used for some optimizations */
 	List *subPlanList;
 	PlannerRestrictionContext *plannerRestrictionContext;
-} RecursivePlanningContext;
+};
 
+/* track depth of current recursive planner query */
+static int recursivePlanningDepth = 0;
 
 /*
  * CteReferenceWalkerContext is used to collect CTE references in
@@ -136,7 +157,7 @@ static void RecursivelyPlanNonColocatedSubqueriesInWhere(Query *query,
 														 colocatedJoinChecker,
 														 RecursivePlanningContext *
 														 recursivePlanningContext);
-static List * SublinkList(Query *originalQuery);
+static List * SublinkListFromWhere(Query *originalQuery);
 static bool ExtractSublinkWalker(Node *node, List **sublinkList);
 static bool ShouldRecursivelyPlanAllSubqueriesInWhere(Query *query);
 static bool RecursivelyPlanAllSubqueries(Node *node,
@@ -151,18 +172,29 @@ static bool AllDistributionKeysInSubqueryAreEqual(Query *subquery,
 												  restrictionContext);
 static bool ShouldRecursivelyPlanSetOperation(Query *query,
 											  RecursivePlanningContext *context);
+static bool RecursivelyPlanSubquery(Query *subquery,
+									RecursivePlanningContext *planningContext);
 static void RecursivelyPlanSetOperations(Query *query, Node *node,
 										 RecursivePlanningContext *context);
-static bool IsLocalTableRTE(Node *node);
-static void RecursivelyPlanSubquery(Query *subquery,
-									RecursivePlanningContext *planningContext);
+static bool IsLocalTableRteOrMatView(Node *node);
 static DistributedSubPlan * CreateDistributedSubPlan(uint32 subPlanId,
 													 Query *subPlanQuery);
 static bool CteReferenceListWalker(Node *node, CteReferenceWalkerContext *context);
-static bool ContainsReferencesToOuterQuery(Query *query);
 static bool ContainsReferencesToOuterQueryWalker(Node *node,
 												 VarLevelsUpWalkerContext *context);
-
+static bool NodeContainsSubqueryReferencingOuterQuery(Node *node);
+static void WrapFunctionsInSubqueries(Query *query);
+static void TransformFunctionRTE(RangeTblEntry *rangeTblEntry);
+static bool ShouldTransformRTE(RangeTblEntry *rangeTableEntry);
+static Query * BuildReadIntermediateResultsQuery(List *targetEntryList,
+												 List *columnAliasList,
+												 Const *resultIdConst, Oid functionOid,
+												 bool useBinaryCopyFormat);
+static void UpdateVarNosInNode(Node *node, Index newVarNo);
+static Query * CreateOuterSubquery(RangeTblEntry *rangeTableEntry,
+								   List *outerSubqueryTargetList);
+static List * GenerateRequiredColNamesFromTargetList(List *targetList);
+static char * GetRelationNameAndAliasName(RangeTblEntry *rangeTablentry);
 
 /*
  * GenerateSubplansForSubqueriesAndCTEs is a wrapper around RecursivelyPlanSubqueriesAndCTEs.
@@ -176,7 +208,8 @@ GenerateSubplansForSubqueriesAndCTEs(uint64 planId, Query *originalQuery,
 									 PlannerRestrictionContext *plannerRestrictionContext)
 {
 	RecursivePlanningContext context;
-	DeferredErrorMessage *error = NULL;
+
+	recursivePlanningDepth++;
 
 	/*
 	 * Plan subqueries and CTEs that cannot be pushed down by recursively
@@ -202,14 +235,15 @@ GenerateSubplansForSubqueriesAndCTEs(uint64 planId, Query *originalQuery,
 	context.allDistributionKeysInQueryAreEqual =
 		AllDistributionKeysInQueryAreEqual(originalQuery, plannerRestrictionContext);
 
-	error = RecursivelyPlanSubqueriesAndCTEs(originalQuery, &context);
+	DeferredErrorMessage *error = RecursivelyPlanSubqueriesAndCTEs(originalQuery,
+																   &context);
 	if (error != NULL)
 	{
+		recursivePlanningDepth--;
 		RaiseDeferredError(error, ERROR);
 	}
 
-	if (context.subPlanList && (log_min_messages <= DEBUG1 || client_min_messages <=
-								DEBUG1))
+	if (context.subPlanList && IsLoggableLevel(DEBUG1))
 	{
 		StringInfo subPlanString = makeStringInfo();
 		pg_get_query_def(originalQuery, subPlanString);
@@ -218,6 +252,8 @@ GenerateSubplansForSubqueriesAndCTEs(uint64 planId, Query *originalQuery,
 							 " query after replacing subqueries and CTEs: %s", planId,
 							 ApplyLogRedaction(subPlanString->data))));
 	}
+
+	recursivePlanningDepth--;
 
 	return context.subPlanList;
 }
@@ -240,9 +276,7 @@ GenerateSubplansForSubqueriesAndCTEs(uint64 planId, Query *originalQuery,
 static DeferredErrorMessage *
 RecursivelyPlanSubqueriesAndCTEs(Query *query, RecursivePlanningContext *context)
 {
-	DeferredErrorMessage *error = NULL;
-
-	error = RecursivelyPlanCTEs(query, context);
+	DeferredErrorMessage *error = RecursivelyPlanCTEs(query, context);
 	if (error != NULL)
 	{
 		return error;
@@ -262,6 +296,9 @@ RecursivelyPlanSubqueriesAndCTEs(Query *query, RecursivePlanningContext *context
 		 */
 		return NULL;
 	}
+
+	/* make sure function calls in joins are executed in the coordinator */
+	WrapFunctionsInSubqueries(query);
 
 	/* descend into subqueries */
 	query_tree_walker(query, RecursivelyPlanSubqueryWalker, context, 0);
@@ -292,6 +329,18 @@ RecursivelyPlanSubqueriesAndCTEs(Query *query, RecursivePlanningContext *context
 		RecursivelyPlanAllSubqueries((Node *) query->jointree->quals, context);
 	}
 
+	if (query->havingQual != NULL)
+	{
+		if (NodeContainsSubqueryReferencingOuterQuery(query->havingQual))
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "Subqueries in HAVING cannot refer to outer query",
+								 NULL, NULL);
+		}
+
+		RecursivelyPlanAllSubqueries(query->havingQual, context);
+	}
+
 	/*
 	 * If the query doesn't have distribution key equality,
 	 * recursively plan some of its subqueries.
@@ -301,7 +350,30 @@ RecursivelyPlanSubqueriesAndCTEs(Query *query, RecursivePlanningContext *context
 		RecursivelyPlanNonColocatedSubqueries(query, context);
 	}
 
+
+	if (ShouldConvertLocalTableJoinsToSubqueries(query->rtable))
+	{
+		/*
+		 * Logical planner cannot handle "local_table" [OUTER] JOIN "dist_table", or
+		 * a query with local table/citus local table and subquery. We convert local/citus local
+		 * tables to a subquery until they can be planned.
+		 */
+		RecursivelyPlanLocalTableJoins(query, context);
+	}
+
+
 	return NULL;
+}
+
+
+/*
+ * GetPlannerRestrictionContext returns the planner restriction context
+ * from the given context.
+ */
+PlannerRestrictionContext *
+GetPlannerRestrictionContext(RecursivePlanningContext *recursivePlanningContext)
+{
+	return recursivePlanningContext->plannerRestrictionContext;
 }
 
 
@@ -340,7 +412,8 @@ ShouldRecursivelyPlanNonColocatedSubqueries(Query *subquery,
 	}
 
 	/* direct joins with local tables are not supported by any of Citus planners */
-	if (FindNodeCheckInRangeTableList(subquery->rtable, IsLocalTableRTE))
+	if (FindNodeMatchingCheckFunctionInRangeTableList(subquery->rtable,
+													  IsLocalTableRteOrMatView))
 	{
 		return false;
 	}
@@ -365,7 +438,7 @@ ShouldRecursivelyPlanNonColocatedSubqueries(Query *subquery,
 static bool
 ContainsSubquery(Query *query)
 {
-	return JoinTreeContainsSubquery(query) || WhereClauseContainsSubquery(query);
+	return JoinTreeContainsSubquery(query) || WhereOrHavingClauseContainsSubquery(query);
 }
 
 
@@ -390,14 +463,12 @@ ContainsSubquery(Query *query)
 static void
 RecursivelyPlanNonColocatedSubqueries(Query *subquery, RecursivePlanningContext *context)
 {
-	ColocatedJoinChecker colocatedJoinChecker;
-
 	FromExpr *joinTree = subquery->jointree;
-	PlannerRestrictionContext *restrictionContext = NULL;
 
 	/* create the context for the non colocated subquery planning */
-	restrictionContext = context->plannerRestrictionContext;
-	colocatedJoinChecker = CreateColocatedJoinChecker(subquery, restrictionContext);
+	PlannerRestrictionContext *restrictionContext = context->plannerRestrictionContext;
+	ColocatedJoinChecker colocatedJoinChecker = CreateColocatedJoinChecker(subquery,
+																		   restrictionContext);
 
 	/*
 	 * Although this is a rare case, we weren't able to pick an anchor
@@ -422,7 +493,7 @@ RecursivelyPlanNonColocatedSubqueries(Query *subquery, RecursivePlanningContext 
  * RecursivelyPlanNonColocatedJoinWalker gets a join node and walks over it to find
  * subqueries that live under the node.
  *
- * When a subquery found, its checked whether the subquery is colocated with the
+ * When a subquery found, it's checked whether the subquery is colocated with the
  * anchor subquery specified in the nonColocatedJoinContext. If not,
  * the subquery is recursively planned.
  */
@@ -470,7 +541,6 @@ RecursivelyPlanNonColocatedJoinWalker(Node *joinNode,
 		int rangeTableIndex = ((RangeTblRef *) joinNode)->rtindex;
 		List *rangeTableList = colocatedJoinChecker->subquery->rtable;
 		RangeTblEntry *rte = rt_fetch(rangeTableIndex, rangeTableList);
-		Query *subquery = NULL;
 
 		/* we're only interested in subqueries for now */
 		if (rte->rtekind != RTE_SUBQUERY)
@@ -482,7 +552,7 @@ RecursivelyPlanNonColocatedJoinWalker(Node *joinNode,
 		 * If the subquery is not colocated with the anchor subquery,
 		 * recursively plan it.
 		 */
-		subquery = rte->subquery;
+		Query *subquery = rte->subquery;
 		if (!SubqueryColocated(subquery, colocatedJoinChecker))
 		{
 			RecursivelyPlanSubquery(subquery, recursivePlanningContext);
@@ -499,7 +569,7 @@ RecursivelyPlanNonColocatedJoinWalker(Node *joinNode,
  * RecursivelyPlanNonColocatedJoinWalker gets a query and walks over its sublinks
  * to find subqueries that live in WHERE clause.
  *
- * When a subquery found, its checked whether the subquery is colocated with the
+ * When a subquery found, it's checked whether the subquery is colocated with the
  * anchor subquery specified in the nonColocatedJoinContext. If not,
  * the subquery is recursively planned.
  */
@@ -509,7 +579,7 @@ RecursivelyPlanNonColocatedSubqueriesInWhere(Query *query,
 											 RecursivePlanningContext *
 											 recursivePlanningContext)
 {
-	List *sublinkList = SublinkList(query);
+	List *sublinkList = SublinkListFromWhere(query);
 	ListCell *sublinkCell = NULL;
 
 	foreach(sublinkCell, sublinkList)
@@ -532,15 +602,14 @@ RecursivelyPlanNonColocatedSubqueriesInWhere(Query *query,
 
 
 /*
- * SublinkList finds the subquery nodes in the where clause of the given query. Note
+ * SublinkListFromWhere finds the subquery nodes in the where clause of the given query. Note
  * that the function should be called on the original query given that postgres
  * standard_planner() may convert the subqueries in WHERE clause to joins.
  */
 static List *
-SublinkList(Query *originalQuery)
+SublinkListFromWhere(Query *originalQuery)
 {
 	FromExpr *joinTree = originalQuery->jointree;
-	Node *queryQuals = NULL;
 	List *sublinkList = NIL;
 
 	if (!joinTree)
@@ -548,7 +617,7 @@ SublinkList(Query *originalQuery)
 		return NIL;
 	}
 
-	queryQuals = joinTree->quals;
+	Node *queryQuals = joinTree->quals;
 	ExtractSublinkWalker(queryQuals, &sublinkList);
 
 	return sublinkList;
@@ -590,24 +659,22 @@ ExtractSublinkWalker(Node *node, List **sublinkList)
 static bool
 ShouldRecursivelyPlanAllSubqueriesInWhere(Query *query)
 {
-	FromExpr *joinTree = NULL;
-	Node *whereClause = NULL;
-
-	joinTree = query->jointree;
+	FromExpr *joinTree = query->jointree;
 	if (joinTree == NULL)
 	{
 		/* there is no FROM clause */
 		return false;
 	}
 
-	whereClause = joinTree->quals;
+	Node *whereClause = joinTree->quals;
 	if (whereClause == NULL)
 	{
 		/* there is no WHERE clause */
 		return false;
 	}
 
-	if (FindNodeCheckInRangeTableList(query->rtable, IsDistributedTableRTE))
+	if (FindNodeMatchingCheckFunctionInRangeTableList(query->rtable,
+													  IsDistributedTableRTE))
 	{
 		/* there is a distributed table in the FROM clause */
 		return false;
@@ -633,8 +700,7 @@ RecursivelyPlanAllSubqueries(Node *node, RecursivePlanningContext *planningConte
 	if (IsA(node, Query))
 	{
 		Query *query = (Query *) node;
-
-		if (FindNodeCheckInRangeTableList(query->rtable, IsDistributedTableRTE))
+		if (FindNodeMatchingCheckFunctionInRangeTableList(query->rtable, IsCitusTableRTE))
 		{
 			RecursivelyPlanSubquery(query, planningContext);
 		}
@@ -683,11 +749,7 @@ RecursivelyPlanCTEs(Query *query, RecursivePlanningContext *planningContext)
 		char *cteName = cte->ctename;
 		Query *subquery = (Query *) cte->ctequery;
 		uint64 planId = planningContext->planId;
-		uint32 subPlanId = 0;
-		char *resultId = NULL;
 		List *cteTargetList = NIL;
-		Query *resultQuery = NULL;
-		DistributedSubPlan *subPlan = NULL;
 		ListCell *rteCell = NULL;
 		int replacedCtesCount = 0;
 
@@ -709,9 +771,9 @@ RecursivelyPlanCTEs(Query *query, RecursivePlanningContext *planningContext)
 			continue;
 		}
 
-		subPlanId = list_length(planningContext->subPlanList) + 1;
+		uint32 subPlanId = list_length(planningContext->subPlanList) + 1;
 
-		if (log_min_messages <= DEBUG1 || client_min_messages <= DEBUG1)
+		if (IsLoggableLevel(DEBUG1))
 		{
 			StringInfo subPlanString = makeStringInfo();
 			pg_get_query_def(subquery, subPlanString);
@@ -722,11 +784,11 @@ RecursivelyPlanCTEs(Query *query, RecursivePlanningContext *planningContext)
 		}
 
 		/* build a sub plan for the CTE */
-		subPlan = CreateDistributedSubPlan(subPlanId, subquery);
+		DistributedSubPlan *subPlan = CreateDistributedSubPlan(subPlanId, subquery);
 		planningContext->subPlanList = lappend(planningContext->subPlanList, subPlan);
 
 		/* build the result_id parameter for the call to read_intermediate_result */
-		resultId = GenerateResultId(planId, subPlanId);
+		char *resultId = GenerateResultId(planId, subPlanId);
 
 		if (subquery->returningList)
 		{
@@ -740,8 +802,8 @@ RecursivelyPlanCTEs(Query *query, RecursivePlanningContext *planningContext)
 		}
 
 		/* replace references to the CTE with a subquery that reads results */
-		resultQuery = BuildSubPlanResultQuery(cteTargetList, cte->aliascolnames,
-											  resultId);
+		Query *resultQuery = BuildSubPlanResultQuery(cteTargetList, cte->aliascolnames,
+													 resultId);
 
 		foreach(rteCell, context.cteReferenceList)
 		{
@@ -812,7 +874,6 @@ RecursivelyPlanSubqueryWalker(Node *node, RecursivePlanningContext *context)
 	if (IsA(node, Query))
 	{
 		Query *query = (Query *) node;
-		DeferredErrorMessage *error = NULL;
 
 		context->level += 1;
 
@@ -820,7 +881,7 @@ RecursivelyPlanSubqueryWalker(Node *node, RecursivePlanningContext *context)
 		 * First, make sure any subqueries and CTEs within this subquery
 		 * are recursively planned if necessary.
 		 */
-		error = RecursivelyPlanSubqueriesAndCTEs(query, context);
+		DeferredErrorMessage *error = RecursivelyPlanSubqueriesAndCTEs(query, context);
 		if (error != NULL)
 		{
 			RaiseDeferredError(error, ERROR);
@@ -853,7 +914,8 @@ RecursivelyPlanSubqueryWalker(Node *node, RecursivePlanningContext *context)
 static bool
 ShouldRecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *context)
 {
-	if (FindNodeCheckInRangeTableList(subquery->rtable, IsLocalTableRTE))
+	if (FindNodeMatchingCheckFunctionInRangeTableList(subquery->rtable,
+													  IsLocalTableRteOrMatView))
 	{
 		/*
 		 * Postgres can always plan queries that don't require distributed planning.
@@ -865,7 +927,7 @@ ShouldRecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *context
 		 * do not contain any other local tables.
 		 */
 	}
-	else if (DeferErrorIfCannotPushdownSubquery(subquery, false) == NULL)
+	else if (CanPushdownSubquery(subquery, false))
 	{
 		/*
 		 * We should do one more check for the distribution key equality.
@@ -886,16 +948,7 @@ ShouldRecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *context
 
 		/*
 		 * Citus can pushdown this subquery, no need to recursively
-		 * plan which is much expensive than pushdown.
-		 */
-		return false;
-	}
-	else if (TaskExecutorType == MULTI_EXECUTOR_TASK_TRACKER &&
-			 SingleRelationRepartitionSubquery(subquery))
-	{
-		/*
-		 * Citus can plan this and execute via repartitioning. Thus,
-		 * no need to recursively plan.
+		 * plan which is much more expensive than pushdown.
 		 */
 		return false;
 	}
@@ -914,19 +967,16 @@ static bool
 AllDistributionKeysInSubqueryAreEqual(Query *subquery,
 									  PlannerRestrictionContext *restrictionContext)
 {
-	bool allDistributionKeysInSubqueryAreEqual = false;
-	PlannerRestrictionContext *filteredRestrictionContext = NULL;
-
 	/* we don't support distribution eq. checks for CTEs yet */
 	if (subquery->cteList != NIL)
 	{
 		return false;
 	}
 
-	filteredRestrictionContext =
+	PlannerRestrictionContext *filteredRestrictionContext =
 		FilterPlannerRestrictionForQuery(restrictionContext, subquery);
 
-	allDistributionKeysInSubqueryAreEqual =
+	bool allDistributionKeysInSubqueryAreEqual =
 		AllDistributionKeysInQueryAreEqual(subquery, filteredRestrictionContext);
 	if (!allDistributionKeysInSubqueryAreEqual)
 	{
@@ -945,8 +995,6 @@ AllDistributionKeysInSubqueryAreEqual(Query *subquery,
 static bool
 ShouldRecursivelyPlanSetOperation(Query *query, RecursivePlanningContext *context)
 {
-	PlannerRestrictionContext *filteredRestrictionContext = NULL;
-
 	SetOperationStmt *setOperations = (SetOperationStmt *) query->setOperations;
 	if (setOperations == NULL)
 	{
@@ -980,7 +1028,7 @@ ShouldRecursivelyPlanSetOperation(Query *query, RecursivePlanningContext *contex
 		return true;
 	}
 
-	filteredRestrictionContext =
+	PlannerRestrictionContext *filteredRestrictionContext =
 		FilterPlannerRestrictionForQuery(context->plannerRestrictionContext, query);
 	if (!SafeToPushdownUnionSubquery(filteredRestrictionContext))
 	{
@@ -1020,7 +1068,7 @@ RecursivelyPlanSetOperations(Query *query, Node *node,
 		Query *subquery = rangeTableEntry->subquery;
 
 		if (rangeTableEntry->rtekind == RTE_SUBQUERY &&
-			QueryContainsDistributedTableRTE(subquery))
+			FindNodeMatchingCheckFunction((Node *) subquery, IsDistributedTableRTE))
 		{
 			RecursivelyPlanSubquery(subquery, context);
 		}
@@ -1035,16 +1083,13 @@ RecursivelyPlanSetOperations(Query *query, Node *node,
 
 
 /*
- * IsLocalTableRTE gets a node and returns true if the node
- * is a range table relation entry that points to a local
- * relation (i.e., not a distributed relation).
+ * IsLocalTableRteOrMatView gets a node and returns true if the node is a range
+ * table entry that points to a postgres local or citus local table or to a
+ * materialized view.
  */
 static bool
-IsLocalTableRTE(Node *node)
+IsLocalTableRteOrMatView(Node *node)
 {
-	RangeTblEntry *rangeTableEntry = NULL;
-	Oid relationId = InvalidOid;
-
 	if (node == NULL)
 	{
 		return false;
@@ -1055,7 +1100,7 @@ IsLocalTableRTE(Node *node)
 		return false;
 	}
 
-	rangeTableEntry = (RangeTblEntry *) node;
+	RangeTblEntry *rangeTableEntry = (RangeTblEntry *) node;
 	if (rangeTableEntry->rtekind != RTE_RELATION)
 	{
 		return false;
@@ -1066,14 +1111,30 @@ IsLocalTableRTE(Node *node)
 		return false;
 	}
 
-	relationId = rangeTableEntry->relid;
-	if (IsDistributedTable(relationId))
+	Oid relationId = rangeTableEntry->relid;
+	return IsRelationLocalTableOrMatView(relationId);
+}
+
+
+/*
+ * IsRelationLocalTableOrMatView returns true if the given relation
+ * is a citus local, local, or materialized view.
+ */
+bool
+IsRelationLocalTableOrMatView(Oid relationId)
+{
+	if (!IsCitusTable(relationId))
 	{
-		return false;
+		/* postgres local table or a materialized view */
+		return true;
+	}
+	else if (IsCitusTableType(relationId, CITUS_LOCAL_TABLE))
+	{
+		return true;
 	}
 
-	/* local table found */
-	return true;
+	/* no local table found */
+	return false;
 }
 
 
@@ -1088,14 +1149,10 @@ IsLocalTableRTE(Node *node)
  * and immediately returns. Later, the planner decides on what to do
  * with the query.
  */
-static void
+static bool
 RecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *planningContext)
 {
-	DistributedSubPlan *subPlan = NULL;
 	uint64 planId = planningContext->planId;
-	int subPlanId = 0;
-	char *resultId = NULL;
-	Query *resultQuery = NULL;
 	Query *debugQuery = NULL;
 
 	if (ContainsReferencesToOuterQuery(subquery))
@@ -1103,36 +1160,37 @@ RecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *planningConte
 		elog(DEBUG2, "skipping recursive planning for the subquery since it "
 					 "contains references to outer queries");
 
-		return;
+		return false;
 	}
 
 	/*
 	 * Subquery will go through the standard planner, thus to properly deparse it
 	 * we keep its copy: debugQuery.
 	 */
-	if (log_min_messages <= DEBUG1 || client_min_messages <= DEBUG1)
+	if (IsLoggableLevel(DEBUG1))
 	{
 		debugQuery = copyObject(subquery);
 	}
 
+
 	/*
 	 * Create the subplan and append it to the list in the planning context.
 	 */
-	subPlanId = list_length(planningContext->subPlanList) + 1;
+	int subPlanId = list_length(planningContext->subPlanList) + 1;
 
-	subPlan = CreateDistributedSubPlan(subPlanId, subquery);
+	DistributedSubPlan *subPlan = CreateDistributedSubPlan(subPlanId, subquery);
 	planningContext->subPlanList = lappend(planningContext->subPlanList, subPlan);
 
 	/* build the result_id parameter for the call to read_intermediate_result */
-	resultId = GenerateResultId(planId, subPlanId);
+	char *resultId = GenerateResultId(planId, subPlanId);
 
 	/*
 	 * BuildSubPlanResultQuery() can optionally use provided column aliases.
 	 * We do not need to send additional alias list for subqueries.
 	 */
-	resultQuery = BuildSubPlanResultQuery(subquery->targetList, NIL, resultId);
+	Query *resultQuery = BuildSubPlanResultQuery(subquery->targetList, NIL, resultId);
 
-	if (log_min_messages <= DEBUG1 || client_min_messages <= DEBUG1)
+	if (IsLoggableLevel(DEBUG1))
 	{
 		StringInfo subqueryString = makeStringInfo();
 
@@ -1144,7 +1202,8 @@ RecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *planningConte
 	}
 
 	/* finally update the input subquery to point the result query */
-	memcpy(subquery, resultQuery, sizeof(Query));
+	*subquery = *resultQuery;
+	return true;
 }
 
 
@@ -1156,7 +1215,6 @@ RecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *planningConte
 static DistributedSubPlan *
 CreateDistributedSubPlan(uint32 subPlanId, Query *subPlanQuery)
 {
-	DistributedSubPlan *subPlan = NULL;
 	int cursorOptions = 0;
 
 	if (ContainsReadIntermediateResultFunction((Node *) subPlanQuery))
@@ -1172,8 +1230,8 @@ CreateDistributedSubPlan(uint32 subPlanId, Query *subPlanQuery)
 		cursorOptions |= CURSOR_OPT_FORCE_DISTRIBUTED;
 	}
 
-	subPlan = CitusMakeNode(DistributedSubPlan);
-	subPlan->plan = planner(subPlanQuery, cursorOptions, NULL);
+	DistributedSubPlan *subPlan = CitusMakeNode(DistributedSubPlan);
+	subPlan->plan = planner_compat(subPlanQuery, cursorOptions, NULL);
 	subPlan->subPlanId = subPlanId;
 
 	return subPlan;
@@ -1211,7 +1269,8 @@ CteReferenceListWalker(Node *node, CteReferenceWalkerContext *context)
 		Query *query = (Query *) node;
 
 		context->level += 1;
-		query_tree_walker(query, CteReferenceListWalker, context, QTW_EXAMINE_RTES);
+		query_tree_walker(query, CteReferenceListWalker, context,
+						  QTW_EXAMINE_RTES_BEFORE);
 		context->level -= 1;
 
 		return false;
@@ -1225,10 +1284,10 @@ CteReferenceListWalker(Node *node, CteReferenceWalkerContext *context)
 
 /*
  * ContainsReferencesToOuterQuery determines whether the given query contains
- * any Vars that point outside of the query itself. Such queries cannot be
+ * anything that points outside of the query itself. Such queries cannot be
  * planned recursively.
  */
-static bool
+bool
 ContainsReferencesToOuterQuery(Query *query)
 {
 	VarLevelsUpWalkerContext context = { 0 };
@@ -1289,12 +1348,11 @@ ContainsReferencesToOuterQueryWalker(Node *node, VarLevelsUpWalkerContext *conte
 	else if (IsA(node, Query))
 	{
 		Query *query = (Query *) node;
-		bool found = false;
 		int flags = 0;
 
 		context->level += 1;
-		found = query_tree_walker(query, ContainsReferencesToOuterQueryWalker,
-								  context, flags);
+		bool found = query_tree_walker(query, ContainsReferencesToOuterQueryWalker,
+									   context, flags);
 		context->level -= 1;
 
 		return found;
@@ -1302,6 +1360,475 @@ ContainsReferencesToOuterQueryWalker(Node *node, VarLevelsUpWalkerContext *conte
 
 	return expression_tree_walker(node, ContainsReferencesToOuterQueryWalker,
 								  context);
+}
+
+
+/*
+ * NodeContainsSubqueryReferencingOuterQuery determines whether the given node
+ * contains anything that points outside of the query itself.
+ */
+static bool
+NodeContainsSubqueryReferencingOuterQuery(Node *node)
+{
+	List *sublinks = NIL;
+	ExtractSublinkWalker(node, &sublinks);
+
+	SubLink *sublink;
+	foreach_ptr(sublink, sublinks)
+	{
+		if (ContainsReferencesToOuterQuery(castNode(Query, sublink->subselect)))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+ * ReplaceRTERelationWithRteSubquery replaces the input rte relation target entry
+ * with a subquery. The function also pushes down the filters to the subquery.
+ *
+ * It then recursively plans the subquery. This subquery is wrapped with another subquery
+ * as a trick to reduce network cost, because we currently don't have an easy way to
+ * skip generating NULL's for non-required columns, and if we create (SELECT a, NULL, NULL FROM table)
+ * then this will be sent over network and NULL's also occupy some space. Instead of this we generate:
+ * (SELECT t.a, NULL, NULL FROM (SELECT a FROM table) t). The inner subquery will be recursively planned
+ * but the outer part will not be yet it will still have the NULL columns so that the query is correct.
+ */
+void
+ReplaceRTERelationWithRteSubquery(RangeTblEntry *rangeTableEntry,
+								  List *requiredAttrNumbers,
+								  RecursivePlanningContext *context)
+{
+	Query *subquery = WrapRteRelationIntoSubquery(rangeTableEntry, requiredAttrNumbers);
+	List *outerQueryTargetList = CreateAllTargetListForRelation(rangeTableEntry->relid,
+																requiredAttrNumbers);
+
+	List *restrictionList =
+		GetRestrictInfoListForRelation(rangeTableEntry,
+									   context->plannerRestrictionContext);
+	List *copyRestrictionList = copyObject(restrictionList);
+	Expr *andedBoundExpressions = make_ands_explicit(copyRestrictionList);
+	subquery->jointree->quals = (Node *) andedBoundExpressions;
+
+	/*
+	 * Originally the quals were pointing to the RTE and its varno
+	 * was pointing to its index in rtable. However now we converted the RTE
+	 * to a subquery and the quals should be pointing to that subquery, which
+	 * is the only RTE in its rtable, hence we update the varnos so that they
+	 * point to the subquery RTE.
+	 * Originally: rtable: [rte1, current_rte, rte3...]
+	 * Now: rtable: [rte1, subquery[current_rte], rte3...] --subquery[current_rte] refers to its rtable.
+	 */
+	Node *quals = subquery->jointree->quals;
+	UpdateVarNosInNode(quals, SINGLE_RTE_INDEX);
+
+	/* replace the function with the constructed subquery */
+	rangeTableEntry->rtekind = RTE_SUBQUERY;
+	rangeTableEntry->subquery = subquery;
+
+	/*
+	 * If the relation is inherited, it'll still be inherited as
+	 * we've copied it earlier. This is to prevent the newly created
+	 * subquery being treated as inherited.
+	 */
+	rangeTableEntry->inh = false;
+
+	if (IsLoggableLevel(DEBUG1))
+	{
+		char *relationAndAliasName = GetRelationNameAndAliasName(rangeTableEntry);
+		ereport(DEBUG1, (errmsg("Wrapping relation %s to a subquery",
+								relationAndAliasName)));
+	}
+
+	/* as we created the subquery, now forcefully recursively plan it */
+	bool recursivelyPlanned = RecursivelyPlanSubquery(subquery, context);
+	if (!recursivelyPlanned)
+	{
+		ereport(ERROR, (errmsg(
+							"unexpected state: query should have been recursively planned")));
+	}
+
+	Query *outerSubquery = CreateOuterSubquery(rangeTableEntry, outerQueryTargetList);
+	rangeTableEntry->subquery = outerSubquery;
+}
+
+
+/*
+ * GetRelationNameAndAliasName returns the relname + alias name if
+ * alias name exists otherwise only the relname is returned.
+ */
+static char *
+GetRelationNameAndAliasName(RangeTblEntry *rangeTableEntry)
+{
+	StringInfo str = makeStringInfo();
+	appendStringInfo(str, "\"%s\"", get_rel_name(rangeTableEntry->relid));
+
+	char *aliasName = NULL;
+	if (rangeTableEntry->alias)
+	{
+		aliasName = rangeTableEntry->alias->aliasname;
+	}
+
+	if (aliasName)
+	{
+		appendStringInfo(str, " \"%s\"", aliasName);
+	}
+	return str->data;
+}
+
+
+/*
+ * CreateOuterSubquery creates outer subquery which contains
+ * the given range table entry in its rtable.
+ */
+static Query *
+CreateOuterSubquery(RangeTblEntry *rangeTableEntry, List *outerSubqueryTargetList)
+{
+	List *innerSubqueryColNames = GenerateRequiredColNamesFromTargetList(
+		outerSubqueryTargetList);
+
+	Query *outerSubquery = makeNode(Query);
+	outerSubquery->commandType = CMD_SELECT;
+
+	/* we copy the input rteRelation to preserve the rteIdentity */
+	RangeTblEntry *innerSubqueryRTE = copyObject(rangeTableEntry);
+
+	innerSubqueryRTE->eref->colnames = innerSubqueryColNames;
+	outerSubquery->rtable = list_make1(innerSubqueryRTE);
+
+	/* set the FROM expression to the subquery */
+	RangeTblRef *newRangeTableRef = makeNode(RangeTblRef);
+	newRangeTableRef->rtindex = 1;
+	outerSubquery->jointree = makeFromExpr(list_make1(newRangeTableRef), NULL);
+
+	outerSubquery->targetList = outerSubqueryTargetList;
+	return outerSubquery;
+}
+
+
+/*
+ * GenerateRequiredColNamesFromTargetList generates the required colnames
+ * from the given target list.
+ */
+static List *
+GenerateRequiredColNamesFromTargetList(List *targetList)
+{
+	TargetEntry *entry = NULL;
+	List *innerSubqueryColNames = NIL;
+	foreach_ptr(entry, targetList)
+	{
+		if (IsA(entry->expr, Var))
+		{
+			/*
+			 * column names of the inner subquery should only contain the
+			 * required columns, as in if we choose 'b' from ('a','b') colnames
+			 * should be 'a' not ('a','b')
+			 */
+			innerSubqueryColNames = lappend(innerSubqueryColNames, makeString(
+												entry->resname));
+		}
+	}
+	return innerSubqueryColNames;
+}
+
+
+/*
+ * UpdateVarNosInNode iterates the Vars in the
+ * given node and updates the varno's as the newVarNo.
+ */
+static void
+UpdateVarNosInNode(Node *node, Index newVarNo)
+{
+	List *varList = pull_var_clause(node, PVC_RECURSE_AGGREGATES |
+									PVC_RECURSE_PLACEHOLDERS);
+	Var *var = NULL;
+	foreach_ptr(var, varList)
+	{
+		var->varno = newVarNo;
+	}
+}
+
+
+/*
+ * IsRecursivelyPlannableRelation returns true if the given range table entry
+ * is a relation type that can be converted to a subquery.
+ */
+bool
+IsRecursivelyPlannableRelation(RangeTblEntry *rangeTableEntry)
+{
+	if (rangeTableEntry->rtekind != RTE_RELATION)
+	{
+		return false;
+	}
+	return rangeTableEntry->relkind == RELKIND_PARTITIONED_TABLE ||
+		   rangeTableEntry->relkind == RELKIND_RELATION ||
+		   rangeTableEntry->relkind == RELKIND_MATVIEW ||
+		   rangeTableEntry->relkind == RELKIND_FOREIGN_TABLE;
+}
+
+
+/*
+ * ContainsLocalTableDistributedTableJoin returns true if the input range table list
+ * contains a direct join between local RTE and an RTE that contains a distributed
+ * or reference table.
+ */
+bool
+ContainsLocalTableDistributedTableJoin(List *rangeTableList)
+{
+	bool containsLocalTable = false;
+	bool containsDistributedTable = false;
+
+	RangeTblEntry *rangeTableEntry = NULL;
+	foreach_ptr(rangeTableEntry, rangeTableList)
+	{
+		if (FindNodeMatchingCheckFunctionInRangeTableList(list_make1(rangeTableEntry),
+														  IsDistributedOrReferenceTableRTE))
+		{
+			containsDistributedTable = true;
+		}
+		else if (IsRecursivelyPlannableRelation(rangeTableEntry) &&
+				 IsLocalTableRteOrMatView((Node *) rangeTableEntry))
+		{
+			/* we consider citus local tables as local table */
+			containsLocalTable = true;
+		}
+	}
+
+	return containsLocalTable && containsDistributedTable;
+}
+
+
+/*
+ * WrapFunctionsInSubqueries iterates over all the immediate Range Table Entries
+ * of a query and wraps the functions inside (SELECT * FROM fnc() f)
+ * subqueries, so that those functions will be executed on the coordinator if
+ * necessary.
+ *
+ * We wrap all the functions that are used in joins except the ones that are
+ * laterally joined or have WITH ORDINALITY clauses.
+ * */
+static void
+WrapFunctionsInSubqueries(Query *query)
+{
+	List *rangeTableList = query->rtable;
+	ListCell *rangeTableCell = NULL;
+
+	/*
+	 * If we have only one function call in a query without any joins, we can
+	 * easily decide where to execute it.
+	 *
+	 * If there are some subqueries and/or functions that are joined with a
+	 * function, it is not trivial to decide whether we should run this
+	 * function in the coordinator or in workers and therefore we may need to
+	 * wrap some of those functions in subqueries.
+	 *
+	 * If we have only one RTE, we leave the parsed query tree as it is. This
+	 * also makes sure we do not wrap an already wrapped function call
+	 * because we know that there will always be 1 RTE in a wrapped function.
+	 * */
+	if (list_length(rangeTableList) < 2)
+	{
+		return;
+	}
+
+	/* iterate over all RTEs and wrap them if necessary */
+	foreach(rangeTableCell, rangeTableList)
+	{
+		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+
+		if (ShouldTransformRTE(rangeTableEntry))
+		{
+			TransformFunctionRTE(rangeTableEntry);
+		}
+	}
+}
+
+
+/*
+ * TransformFunctionRTE wraps a given function RangeTableEntry
+ * inside a (SELECT * from function() f) subquery.
+ *
+ * The said RangeTableEntry is modified and now points to the new subquery.
+ * */
+static void
+TransformFunctionRTE(RangeTblEntry *rangeTblEntry)
+{
+	Query *subquery = makeNode(Query);
+	RangeTblRef *newRangeTableRef = makeNode(RangeTblRef);
+	Var *targetColumn = NULL;
+	TargetEntry *targetEntry = NULL;
+	AttrNumber targetColumnIndex = 0;
+
+	RangeTblFunction *rangeTblFunction = linitial(rangeTblEntry->functions);
+
+	subquery->commandType = CMD_SELECT;
+
+	/* copy the input rangeTblEntry to prevent cycles */
+	RangeTblEntry *newRangeTableEntry = copyObject(rangeTblEntry);
+
+	/* set the FROM expression to the subquery */
+	subquery->rtable = list_make1(newRangeTableEntry);
+	newRangeTableRef->rtindex = 1;
+	subquery->jointree = makeFromExpr(list_make1(newRangeTableRef), NULL);
+
+	/* Determine the result type of the function.
+	 *
+	 * If function return type is not composite or rowtype can't be determined,
+	 * tupleDesc is set to null here
+	 */
+	TupleDesc tupleDesc = (TupleDesc) get_expr_result_tupdesc(rangeTblFunction->funcexpr,
+															  true);
+
+	/*
+	 * If tupleDesc is not null, we iterate over all the attributes and
+	 * create targetEntries
+	 * */
+	if (tupleDesc)
+	{
+		/*
+		 * A sample function join that end up here:
+		 *
+		 * CREATE FUNCTION f(..) RETURNS TABLE(c1 int, c2 text) AS .. ;
+		 * SELECT .. FROM table JOIN f(..) ON ( .. ) ;
+		 *
+		 * We will iterate over Tuple Description attributes. i.e (c1 int, c2 text)
+		 */
+		if (tupleDesc->natts > MaxAttrNumber)
+		{
+			ereport(ERROR, (errmsg("bad number of tuple descriptor attributes")));
+		}
+		AttrNumber natts = tupleDesc->natts;
+		for (targetColumnIndex = 0; targetColumnIndex < natts;
+			 targetColumnIndex++)
+		{
+			FormData_pg_attribute *attribute = TupleDescAttr(tupleDesc,
+															 targetColumnIndex);
+			Oid columnType = attribute->atttypid;
+			char *columnName = attribute->attname.data;
+
+			/*
+			 * The indexing of attributes and TupleDesc and varattno differ
+			 *
+			 * varattno=0 corresponds to whole row
+			 * varattno=1 corresponds to first column that is stored in tupDesc->attrs[0]
+			 *
+			 * That's why we need to add one to the targetColumnIndex
+			 * */
+			targetColumn = makeVar(1, targetColumnIndex + 1, columnType, -1, InvalidOid,
+								   0);
+			targetEntry = makeTargetEntry((Expr *) targetColumn, targetColumnIndex + 1,
+										  columnName, false);
+			subquery->targetList = lappend(subquery->targetList, targetEntry);
+		}
+	}
+
+	/*
+	 * If tupleDesc is NULL we have 2 different cases:
+	 *
+	 * 1. The function returns a record but the attributes can not be
+	 * determined just by looking at the function definition. In this case the
+	 * column names and types must be defined explicitly in the query
+	 *
+	 * 2. The function returns a non-composite type (e.g. int, text, jsonb ..)
+	 * */
+	else
+	{
+		/* create target entries for all columns returned by the function */
+		ListCell *functionColumnName = NULL;
+
+		List *functionColumnNames = rangeTblEntry->eref->colnames;
+		foreach(functionColumnName, functionColumnNames)
+		{
+			char *columnName = strVal(lfirst(functionColumnName));
+			Oid columnType = InvalidOid;
+
+			/*
+			 * If the function returns a set of records, the query needs
+			 * to explicitly name column names and types
+			 *
+			 * Use explicitly defined types in the query if they are
+			 * available
+			 * */
+			if (list_length(rangeTblFunction->funccoltypes) > 0)
+			{
+				/*
+				 * A sample function join that end up here:
+				 *
+				 * CREATE FUNCTION get_set_of_records() RETURNS SETOF RECORD AS
+				 * $cmd$
+				 * SELECT x, x+1 FROM generate_series(0,4) f(x)
+				 * $cmd$
+				 * LANGUAGE SQL;
+				 *
+				 * SELECT *
+				 * FROM table1 JOIN get_set_of_records() AS t2(x int, y int)
+				 * ON (id = x);
+				 *
+				 * Note that the function definition does not have column
+				 * names and types. Therefore the user needs to explicitly
+				 * state them in the query
+				 * */
+				columnType = list_nth_oid(rangeTblFunction->funccoltypes,
+										  targetColumnIndex);
+			}
+
+			/* use the types in the function definition otherwise */
+			else
+			{
+				/*
+				 * Only functions returning simple types end up here.
+				 * A sample function:
+				 *
+				 * CREATE FUNCTION add(integer, integer) RETURNS integer AS
+				 * 'SELECT $1 + $2;'
+				 * LANGUAGE SQL;
+				 * SELECT * FROM table JOIN add(3,5) sum ON ( .. ) ;
+				 * */
+				FuncExpr *funcExpr = (FuncExpr *) rangeTblFunction->funcexpr;
+				columnType = funcExpr->funcresulttype;
+			}
+
+			/* Note that the column k is associated with varattno/resno of k+1 */
+			targetColumn = makeVar(1, targetColumnIndex + 1, columnType, -1,
+								   InvalidOid, 0);
+			targetEntry = makeTargetEntry((Expr *) targetColumn,
+										  targetColumnIndex + 1, columnName, false);
+			subquery->targetList = lappend(subquery->targetList, targetEntry);
+
+			targetColumnIndex++;
+		}
+	}
+
+	/* replace the function with the constructed subquery */
+	rangeTblEntry->rtekind = RTE_SUBQUERY;
+	rangeTblEntry->subquery = subquery;
+}
+
+
+/*
+ * ShouldTransformRTE determines whether a given RTE should bne wrapped in a
+ * subquery.
+ *
+ * Not all functions should be wrapped in a subquery for now. As we support more
+ * functions to be used in joins, the constraints here will be relaxed.
+ * */
+static bool
+ShouldTransformRTE(RangeTblEntry *rangeTableEntry)
+{
+	/*
+	 * We should wrap only function rtes that are not LATERAL and
+	 * without WITH ORDINALITY clause
+	 */
+	if (rangeTableEntry->rtekind != RTE_FUNCTION ||
+		rangeTableEntry->lateral ||
+		rangeTableEntry->funcordinality)
+	{
+		return false;
+	}
+	return true;
 }
 
 
@@ -1323,23 +1850,79 @@ ContainsReferencesToOuterQueryWalker(Node *node, VarLevelsUpWalkerContext *conte
 Query *
 BuildSubPlanResultQuery(List *targetEntryList, List *columnAliasList, char *resultId)
 {
-	Query *resultQuery = NULL;
-	Const *resultIdConst = NULL;
-	Const *resultFormatConst = NULL;
-	FuncExpr *funcExpr = NULL;
-	Alias *funcAlias = NULL;
+	Oid functionOid = CitusReadIntermediateResultFuncId();
+	bool useBinaryCopyFormat = CanUseBinaryCopyFormatForTargetList(targetEntryList);
+
+	Const *resultIdConst = makeNode(Const);
+	resultIdConst->consttype = TEXTOID;
+	resultIdConst->consttypmod = -1;
+	resultIdConst->constlen = -1;
+	resultIdConst->constvalue = CStringGetTextDatum(resultId);
+	resultIdConst->constbyval = false;
+	resultIdConst->constisnull = false;
+	resultIdConst->location = -1;
+
+	return BuildReadIntermediateResultsQuery(targetEntryList, columnAliasList,
+											 resultIdConst, functionOid,
+											 useBinaryCopyFormat);
+}
+
+
+/*
+ * BuildReadIntermediateResultsArrayQuery returns a query of the form:
+ *
+ * SELECT
+ *   <target list>
+ * FROM
+ *   read_intermediate_results(ARRAY['<resultId>', ...]::text[], '<copy format'>)
+ *   AS res (<column definition list>);
+ *
+ * The caller can optionally supply a columnAliasList, which is useful for
+ * CTEs that have column aliases.
+ *
+ * If useBinaryCopyFormat is true, then 'binary' format is used. Otherwise,
+ * 'text' format is used.
+ */
+Query *
+BuildReadIntermediateResultsArrayQuery(List *targetEntryList,
+									   List *columnAliasList,
+									   List *resultIdList,
+									   bool useBinaryCopyFormat)
+{
+	Oid functionOid = CitusReadIntermediateResultArrayFuncId();
+
+	Const *resultIdConst = makeNode(Const);
+	resultIdConst->consttype = TEXTARRAYOID;
+	resultIdConst->consttypmod = -1;
+	resultIdConst->constlen = -1;
+	resultIdConst->constvalue = PointerGetDatum(strlist_to_textarray(resultIdList));
+	resultIdConst->constbyval = false;
+	resultIdConst->constisnull = false;
+	resultIdConst->location = -1;
+
+	return BuildReadIntermediateResultsQuery(targetEntryList, columnAliasList,
+											 resultIdConst, functionOid,
+											 useBinaryCopyFormat);
+}
+
+
+/*
+ * BuildReadIntermediateResultsQuery is the common code for generating
+ * queries to read from result files. It is used by
+ * BuildReadIntermediateResultsArrayQuery and BuildSubPlanResultQuery.
+ */
+static Query *
+BuildReadIntermediateResultsQuery(List *targetEntryList, List *columnAliasList,
+								  Const *resultIdConst, Oid functionOid,
+								  bool useBinaryCopyFormat)
+{
 	List *funcColNames = NIL;
 	List *funcColTypes = NIL;
 	List *funcColTypMods = NIL;
 	List *funcColCollations = NIL;
-	RangeTblFunction *rangeTableFunction = NULL;
-	RangeTblEntry *rangeTableEntry = NULL;
-	RangeTblRef *rangeTableRef = NULL;
-	FromExpr *joinTree = NULL;
 	ListCell *targetEntryCell = NULL;
 	List *targetList = NIL;
 	int columnNumber = 1;
-	bool useBinaryCopyFormat = true;
 	Oid copyFormatId = BinaryCopyFormatId();
 	int columnAliasCount = list_length(columnAliasList);
 
@@ -1352,8 +1935,6 @@ BuildSubPlanResultQuery(List *targetEntryList, List *columnAliasList, char *resu
 		Oid columnType = exprType(targetExpr);
 		Oid columnTypMod = exprTypmod(targetExpr);
 		Oid columnCollation = exprCollation(targetExpr);
-		Var *functionColumnVar = NULL;
-		TargetEntry *newTargetEntry = NULL;
 
 		if (targetEntry->resjunk)
 		{
@@ -1365,18 +1946,18 @@ BuildSubPlanResultQuery(List *targetEntryList, List *columnAliasList, char *resu
 		funcColTypMods = lappend_int(funcColTypMods, columnTypMod);
 		funcColCollations = lappend_int(funcColCollations, columnCollation);
 
-		functionColumnVar = makeNode(Var);
+		Var *functionColumnVar = makeNode(Var);
 		functionColumnVar->varno = 1;
 		functionColumnVar->varattno = columnNumber;
 		functionColumnVar->vartype = columnType;
 		functionColumnVar->vartypmod = columnTypMod;
 		functionColumnVar->varcollid = columnCollation;
 		functionColumnVar->varlevelsup = 0;
-		functionColumnVar->varnoold = 1;
-		functionColumnVar->varoattno = columnNumber;
+		functionColumnVar->varnosyn = 1;
+		functionColumnVar->varattnosyn = columnNumber;
 		functionColumnVar->location = -1;
 
-		newTargetEntry = makeNode(TargetEntry);
+		TargetEntry *newTargetEntry = makeNode(TargetEntry);
 		newTargetEntry->expr = (Expr *) functionColumnVar;
 		newTargetEntry->resno = columnNumber;
 
@@ -1400,22 +1981,8 @@ BuildSubPlanResultQuery(List *targetEntryList, List *columnAliasList, char *resu
 
 		targetList = lappend(targetList, newTargetEntry);
 
-		if (useBinaryCopyFormat && !CanUseBinaryCopyFormatForType(columnType))
-		{
-			useBinaryCopyFormat = false;
-		}
-
 		columnNumber++;
 	}
-
-	resultIdConst = makeNode(Const);
-	resultIdConst->consttype = TEXTOID;
-	resultIdConst->consttypmod = -1;
-	resultIdConst->constlen = -1;
-	resultIdConst->constvalue = CStringGetTextDatum(resultId);
-	resultIdConst->constbyval = false;
-	resultIdConst->constisnull = false;
-	resultIdConst->location = -1;
 
 	/* build the citus_copy_format parameter for the call to read_intermediate_result */
 	if (!useBinaryCopyFormat)
@@ -1423,7 +1990,7 @@ BuildSubPlanResultQuery(List *targetEntryList, List *columnAliasList, char *resu
 		copyFormatId = TextCopyFormatId();
 	}
 
-	resultFormatConst = makeNode(Const);
+	Const *resultFormatConst = makeNode(Const);
 	resultFormatConst->consttype = CitusCopyFormatTypeId();
 	resultFormatConst->consttypmod = -1;
 	resultFormatConst->constlen = 4;
@@ -1433,8 +2000,8 @@ BuildSubPlanResultQuery(List *targetEntryList, List *columnAliasList, char *resu
 	resultFormatConst->location = -1;
 
 	/* build the call to read_intermediate_result */
-	funcExpr = makeNode(FuncExpr);
-	funcExpr->funcid = CitusReadIntermediateResultFuncId();
+	FuncExpr *funcExpr = makeNode(FuncExpr);
+	funcExpr->funcid = functionOid;
 	funcExpr->funcretset = true;
 	funcExpr->funcvariadic = false;
 	funcExpr->funcformat = 0;
@@ -1444,7 +2011,7 @@ BuildSubPlanResultQuery(List *targetEntryList, List *columnAliasList, char *resu
 	funcExpr->args = list_make2(resultIdConst, resultFormatConst);
 
 	/* build the RTE for the call to read_intermediate_result */
-	rangeTableFunction = makeNode(RangeTblFunction);
+	RangeTblFunction *rangeTableFunction = makeNode(RangeTblFunction);
 	rangeTableFunction->funccolcount = list_length(funcColNames);
 	rangeTableFunction->funccolnames = funcColNames;
 	rangeTableFunction->funccoltypes = funcColTypes;
@@ -1453,25 +2020,25 @@ BuildSubPlanResultQuery(List *targetEntryList, List *columnAliasList, char *resu
 	rangeTableFunction->funcparams = NULL;
 	rangeTableFunction->funcexpr = (Node *) funcExpr;
 
-	funcAlias = makeNode(Alias);
+	Alias *funcAlias = makeNode(Alias);
 	funcAlias->aliasname = "intermediate_result";
 	funcAlias->colnames = funcColNames;
 
-	rangeTableEntry = makeNode(RangeTblEntry);
+	RangeTblEntry *rangeTableEntry = makeNode(RangeTblEntry);
 	rangeTableEntry->rtekind = RTE_FUNCTION;
 	rangeTableEntry->functions = list_make1(rangeTableFunction);
 	rangeTableEntry->inFromCl = true;
 	rangeTableEntry->eref = funcAlias;
 
 	/* build the join tree using the read_intermediate_result RTE */
-	rangeTableRef = makeNode(RangeTblRef);
+	RangeTblRef *rangeTableRef = makeNode(RangeTblRef);
 	rangeTableRef->rtindex = 1;
 
-	joinTree = makeNode(FromExpr);
+	FromExpr *joinTree = makeNode(FromExpr);
 	joinTree->fromlist = list_make1(rangeTableRef);
 
 	/* build the SELECT query */
-	resultQuery = makeNode(Query);
+	Query *resultQuery = makeNode(Query);
 	resultQuery->commandType = CMD_SELECT;
 	resultQuery->rtable = list_make1(rangeTableEntry);
 	resultQuery->jointree = joinTree;
@@ -1493,4 +2060,15 @@ GenerateResultId(uint64 planId, uint32 subPlanId)
 	appendStringInfo(resultId, UINT64_FORMAT "_%u", planId, subPlanId);
 
 	return resultId->data;
+}
+
+
+/*
+ * GeneratingSubplans returns true if we are currently in the process of
+ * generating subplans.
+ */
+bool
+GeneratingSubplans(void)
+{
+	return recursivePlanningDepth > 0;
 }

@@ -1,9 +1,15 @@
--- 
+--
 -- Tests sequential and parallel DDL command execution
 -- in combination with 1PC and 2PC
 -- Note: this test should not be executed in parallel with
--- other tests since we're relying on disabling 2PC recovery 
+-- other tests since we're relying on disabling 2PC recovery
 --
+-- We're also setting force_max_query_parallelization throughout
+-- the tests because the test file has the assumption that
+-- each placement is accessed with a seperate connection
+SET citus.force_max_query_parallelization TO on;
+
+
 CREATE SCHEMA test_seq_ddl;
 SET search_path TO 'test_seq_ddl';
 SET citus.next_shard_id TO 16000;
@@ -28,7 +34,7 @@ LANGUAGE 'plpgsql' IMMUTABLE;
 
 -- this function simply checks the equality of the number of transactions in the
 -- pg_dist_transaction and number of shard placements for a distributed table
--- The function is useful to ensure that a single connection is opened per 
+-- The function is useful to ensure that a single connection is opened per
 -- shard placement in a distributed transaction
 CREATE OR REPLACE FUNCTION distributed_2PCs_are_equal_to_placement_count()
     RETURNS bool AS
@@ -117,12 +123,12 @@ SELECT recover_prepared_transactions();
 CREATE INDEX ref_test_seq_index_2 ON ref_test(a);
 SELECT distributed_2PCs_are_equal_to_worker_count();
 
--- tables with replication factor > 1 should also obey 
+-- tables with replication factor > 1 should also obey
 -- both multi_shard_commit_protocol and multi_shard_modify_mode
 SET citus.shard_replication_factor TO 2;
 CREATE TABLE test_table_rep_2 (a int);
 SELECT create_distributed_table('test_table_rep_2', 'a');
- 
+
 -- 1PC should never use 2PC with rep > 1
 SET citus.multi_shard_commit_protocol TO '1pc';
 
@@ -207,13 +213,13 @@ SELECT create_distributed_table('multi_shard_modify_test', 't_key');
 -- with parallel modification mode, we should see #shards records
 SET citus.multi_shard_modify_mode TO 'parallel';
 SELECT recover_prepared_transactions();
-SELECT master_modify_multiple_shards('DELETE FROM multi_shard_modify_test');
+DELETE FROM multi_shard_modify_test;
 SELECT distributed_2PCs_are_equal_to_placement_count();
 
 -- with sequential modification mode, we should see #primary worker records
 SET citus.multi_shard_modify_mode TO 'sequential';
 SELECT recover_prepared_transactions();
-SELECT master_modify_multiple_shards('DELETE FROM multi_shard_modify_test');
+DELETE FROM multi_shard_modify_test;
 SELECT distributed_2PCs_are_equal_to_worker_count();
 
 -- one more realistic test with sequential inserts and truncate in the same tx
@@ -267,7 +273,7 @@ BEGIN;
     SET LOCAL citus.multi_shard_modify_mode TO 'sequential';
     SELECT create_distributed_table('test_seq_multi_shard_update', 'a');
     INSERT INTO test_seq_multi_shard_update VALUES (0, 0), (1, 0), (2, 0), (3, 0), (4, 0);
-    SELECT master_modify_multiple_shards('DELETE FROM test_seq_multi_shard_update WHERE b < 2');
+    DELETE FROM test_seq_multi_shard_update WHERE b < 2;
 COMMIT;
 SELECT distributed_2PCs_are_equal_to_worker_count();
 DROP TABLE test_seq_multi_shard_update;
